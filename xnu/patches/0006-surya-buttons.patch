@@ -1,0 +1,243 @@
+diff --git a/bsd/dev/surya_keys.c b/bsd/dev/surya_keys.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/surya_keys.c
+@@ -0,0 +1,300 @@
++/*
++ * Buttons driver for surya (Poco X3 NFC)
++ * 
++ * Hardware buttons:
++ * - Power: PMIC PM8916 PWRKEY (SPMI SID 0, reg 0x800)
++ * - Volume Up: GPIO key via msmgpio (pin 107 = 0x6b, active low)
++ * - Volume Down: Need to verify (likely another GPIO key)
++ * 
++ * DTB gpio_keys node:
++ *   button@0: "Volume Up", gpios = <&msmgpio 107 1>
++ *   (flags: 1 = active low)
++ * 
++ * Power key is handled via PMIC interrupt (SPMI)
++ */
++#include <sys/param.h>
++#include <sys/kernel.h>
++#include <sys/malloc.h>
++#include <sys/device.h>
++#include <sys/conf.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <machine/bus.h>
++#include <arm/cpu.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/hidsystem/IOHIDTypes.h>
++#include <IOKit/hidsystem/ev_keymap.h>
++
++/* MSMGPIO base from DTB: pinctrl@1000000 */
++#define MSMGPIO_BASE		0x01000000
++#define MSMGPIO_SIZE		0x300000
++
++/* GPIO register offsets (MSM GPIO controller) */
++#define GPIO_IN_OUT		0x0000
++#define GPIO_INT_EN		0x0004
++#define GPIO_INT_STATUS		0x0008
++#define GPIO_INT_CLEAR		0x000c
++#define GPIO_INT_TYPE		0x0010
++#define GPIO_INT_POLARITY	0x0014
++#define GPIO_CONFIG		0x0018
++#define GPIO_DS			0x001c
++#define GPIO_PULL		0x0020
++
++/* Each GPIO has 4 registers at base + gpio * 0x1000 */
++#define GPIO_REG_BASE(gpio)	(MSMGPIO_BASE + (gpio) * 0x1000)
++
++/* Button GPIO pins (from DTB) */
++#define SURYA_GPIO_VOL_UP	107  /* 0x6b */
++#define SURYA_GPIO_VOL_DOWN	108  /* Need to verify - assuming 108 */
++#define SURYA_GPIO_POWER	-1   /* Power is on PMIC, not GPIO */
++
++static bus_space_tag_t gpio_iot;
++static bus_space_handle_t gpio_ioh;
++static int surya_keys_initialized = 0;
++
++/* HID event callback */
++static void (*surya_hid_key_callback)(int key, int down) = NULL;
++static void (*surya_hid_touch_callback)(int finger, int down, int x, int y) = NULL;
++
++void
++surya_keys_set_callbacks(void (*key_cb)(int, int), void (*touch_cb)(int, int, int, int))
++{
++	surya_hid_key_callback = key_cb;
++	surya_hid_touch_callback = touch_cb;
++}
++
++/*
++ * MSMGPIO helpers
++ */
++static inline void
++gpio_write(uint32_t gpio, uint32_t reg, uint32_t val)
++{
++	bus_space_write_4(gpio_iot, gpio_ioh, GPIO_REG_BASE(gpio) + reg, val);
++}
++
++static inline uint32_t
++gpio_read(uint32_t gpio, uint32_t reg)
++{
++	return bus_space_read_4(gpio_iot, gpio_ioh, GPIO_REG_BASE(gpio) + reg);
++}
++
++static void
++surya_gpio_configure_input(uint32_t gpio, int active_low)
++{
++	/* Configure as input */
++	gpio_write(gpio, GPIO_CONFIG, 0x0); /* Input mode */
++	
++	/* Enable pull-up for active-low buttons */
++	if (active_low)
++		gpio_write(gpio, GPIO_PULL, 0x1); /* Pull-up */
++	else
++		gpio_write(gpio, GPIO_PULL, 0x2); /* Pull-down */
++	
++	/* Configure interrupt: edge-triggered, active low */
++	gpio_write(gpio, GPIO_INT_TYPE, 0x0); /* Edge */
++	gpio_write(gpio, GPIO_INT_POLARITY, active_low ? 0x0 : 0x1); /* Active low/high */
++	gpio_write(gpio, GPIO_INT_EN, 0x1); /* Enable interrupt */
++	gpio_write(gpio, GPIO_INT_CLEAR, 0x1); /* Clear any pending */
++}
++
++/*
++ * GPIO interrupt handler for volume buttons
++ */
++static void
++surya_gpio_intr_handler(void *arg)
++{
++	uint32_t gpio = (uint32_t)(uintptr_t)arg;
++	uint32_t status = gpio_read(gpio, GPIO_INT_STATUS);
++	
++	if (status & 0x1) {
++		int down = (gpio_read(gpio, GPIO_IN_OUT) & 0x1) ? 0 : 1; /* Active low */
++		
++		if (gpio == SURYA_GPIO_VOL_UP) {
++			kprintf("SURYA Keys: Volume Up %s\n", down ? "down" : "up");
++			if (surya_hid_key_callback)
++				surya_hid_key_callback(1, down); /* 1 = Volume Up */
++		} else if (gpio == SURYA_GPIO_VOL_DOWN) {
++			kprintf("SURYA Keys: Volume Down %s\n", down ? "down" : "up");
++			if (surya_hid_key_callback)
++				surya_hid_key_callback(2, down); /* 2 = Volume Down */
++		}
++		
++		/* Clear interrupt */
++		gpio_write(gpio, GPIO_INT_CLEAR, 0x1);
++	}
++}
++
++/*
++ * Initialize GPIO buttons (Volume Up/Down)
++ */
++static int
++surya_gpio_keys_init(void)
++{
++	gpio_iot = &arm_bus_space_generic;
++	
++	if (bus_space_map(gpio_iot, MSMGPIO_BASE, MSMGPIO_SIZE, 0, &gpio_ioh)) {
++		kprintf("SURYA Keys: Failed to map MSMGPIO\n");
++		return ENXIO;
++	}
++	
++	/* Configure Volume Up (GPIO 107, active low) */
++	surya_gpio_configure_input(SURYA_GPIO_VOL_UP, 1);
++	
++	/* Configure Volume Down (GPIO 108, active low) - need to verify pin */
++	surya_gpio_configure_input(SURYA_GPIO_VOL_DOWN, 1);
++	
++	/* Register interrupt handlers */
++	/* TODO: Hook up to interrupt controller (DTB shows gpio_keys interrupt) */
++	
++	kprintf("SURYA Keys: GPIO buttons initialized (Vol+=%d, Vol-=%d)\n",
++	        SURYA_GPIO_VOL_UP, SURYA_GPIO_VOL_DOWN);
++	return 0;
++}
++
++/*
++ * PMIC power key handler (called from PMIC driver)
++ */
++void
++surya_pmic_pwrkey_event(int down)
++{
++	kprintf("SURYA Keys: Power key %s\n", down ? "down" : "up");
++	if (surya_hid_key_callback)
++		surya_hid_key_callback(0, down); /* 0 = Power */
++}
++
++/*
++ * Main keys initialization
++ */
++int
++surya_keys_init(void)
++{
++	if (surya_keys_initialized)
++		return 0;
++	
++	int err = surya_gpio_keys_init();
++	if (err)
++		return err;
++	
++	/* PMIC power key is initialized in surya_pmic_init() */
++	
++	surya_keys_initialized = 1;
++	kprintf("SURYA Keys: Initialized\n");
++	return 0;
++}
++
++/*
++ * Get button state (for polling if interrupts not working)
++ */
++int
++surya_keys_get_state(int button)
++{
++	switch (button) {
++	case 0: /* Power - read from PMIC */
++		/* TODO: read PMIC PWRKEY status */
++		return 0;
++	case 1: /* Volume Up */
++		return (gpio_read(SURYA_GPIO_VOL_UP, GPIO_IN_OUT) & 0x1) ? 0 : 1;
++	case 2: /* Volume Down */
++		return (gpio_read(SURYA_GPIO_VOL_DOWN, GPIO_IN_OUT) & 0x1) ? 0 : 1;
++	default:
++		return 0;
++	}
++}
+diff --git a/bsd/dev/surya_keys.h b/bsd/dev/surya_keys.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/surya_keys.h
+@@ -0,0 +1,50 @@
++/*
++ * Surya buttons driver interface
++ */
++#ifndef _SURYA_KEYS_H_
++#define _SURYA_KEYS_H_
++
++#include <sys/types.h>
++
++__BEGIN_DECLS
++
++int surya_keys_init(void);
++void surya_keys_set_callbacks(void (*key_cb)(int, int), void (*touch_cb)(int, int, int, int));
++void surya_pmic_pwrkey_event(int down);
++int surya_keys_get_state(int button);
++
++__END_DECLS
++
++#endif /* _SURYA_KEYS_H_ */
+diff --git a/bsd/dev/Makefile b/bsd/dev/Makefile
+--- a/bsd/dev/Makefile
++++ b/bsd/dev/Makefile
+@@ -10,6 +10,7 @@
+ 	sweet_keys.o \
+ 	sweet_touch.o \
+ 	sweet_ufs.o \
+ 	surya_pmic.o \
+ 	surya_display.o \
++	surya_keys.o \
+ 	sweet_rpmh.o \
+ 	sweet_hid.o \
+ 	_sweet.o

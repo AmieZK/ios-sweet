@@ -1,0 +1,301 @@
+diff --git a/bsd/dev/surya_rpm.c b/bsd/dev/surya_rpm.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/surya_rpm.c
+@@ -0,0 +1,350 @@
++/*
++ * RPM (Resource Power Manager) driver for surya (SM7150)
++ * 
++ * RPM is the Qualcomm resource manager that handles:
++ * - Clock control
++ * - Power domain control
++ * - Regulator control (via PMIC)
++ * - Bus scaling
++ * 
++ * Communication via SMD (Shared Memory Driver) channels.
++ * DTB shows: rpm@0 with qcom,ipc and qcom,smd-edge
++ * 
++ * This is a simplified implementation for basic clock/power enable.
++ */
++#include <sys/param.h>
++#include <sys/kernel.h>
++#include <sys/malloc.h>
++#include <sys/device.h>
++#include <sys/conf.h>
++#include <machine/bus.h>
++#include <arm/cpu.h>
++#include <pexpert/pexpert.h>
++
++/* RPM SMD channel */
++#define RPM_SMD_CHANNEL		"rpm_requests"
++
++/* RPM request types */
++#define RPM_CLK_REQ		1
++#define RPM_PWR_REQ		2
++#define RPM_REGULATOR_REQ	3
++#define RPM_BUS_REQ		4
++
++/* Clock IDs (common for SM7150) */
++enum {
++	RPM_CLK_GCC_BASE		= 0x100,
++	RPM_CLK_MDSS_ESC0		= 0x101,
++	RPM_CLK_MDSS_ESC1		= 0x102,
++	RPM_CLK_DSI_CORE		= 0x103,
++	RPM_CLK_DSI_BYTE		= 0x104,
++	RPM_CLK_DSI_PIXEL		= 0x105,
++	RPM_CLK_UFS_AXI		= 0x106,
++	RPM_CLK_UFS_PHY		= 0x107,
++	RPM_CLK_GPU			= 0x108,
++	RPM_CLK_CPU			= 0x109,
++};
++
++/* Power domain IDs */
++enum {
++	RPM_PD_MDSS			= 0x200,
++	RPM_PD_GPU			= 0x201,
++	RPM_PD_UFS			= 0x202,
++	RPM_PD_CPU			= 0x203,
++};
++
++/* Regulator IDs (PM8916 LDOs/SMPS via RPM) */
++enum {
++	RPM_REG_L1			= 0x300,  /* LDO 1 */
++	RPM_REG_L2			= 0x301,  /* LDO 2 (1.2V fixed) */
++	RPM_REG_L3			= 0x302,
++	RPM_REG_L4			= 0x303,
++	RPM_REG_L5			= 0x304,
++	RPM_REG_L6			= 0x305,  /* LDO 6 (1.8V fixed) */
++	RPM_REG_L7			= 0x306,
++	RPM_REG_L8			= 0x307,
++	RPM_REG_L9			= 0x308,
++	RPM_REG_L10			= 0x309,
++	RPM_REG_L11			= 0x30a,  /* LDO 11 - touch power? */
++	RPM_REG_L12			= 0x30b,
++	RPM_REG_L13			= 0x30c,
++	RPM_REG_L14			= 0x30d,
++	RPM_REG_L15			= 0x30e,  /* LDO 15 - always on */
++	RPM_REG_L16			= 0x30f,
++	RPM_REG_L17			= 0x310,  /* LDO 17 (3.3V fixed) */
++	RPM_REG_L18			= 0x311,
++	RPM_REG_S1			= 0x320,  /* SMPS 1 */
++	RPM_REG_S2			= 0x321,
++	RPM_REG_S3			= 0x322,  /* SMPS 3 (1.8V fixed, always on) */
++	RPM_REG_S4			= 0x323,  /* SMPS 4 (1.8V fixed, always on) */
++};
++
++static int surya_rpm_initialized = 0;
++static void *rpm_smd_channel = NULL;
++
++/*
++ * SMD (Shared Memory Driver) helpers
++ * In reality, this uses qcom_smd APIs. Simplified here.
++ */
++static int
++rpm_smd_send_request(uint32_t req_type, uint32_t id, uint32_t value)
++{
++	/* TODO: Implement actual SMD communication */
++	/* For now, log the request */
++	kprintf("SURYA RPM: Request type=%u id=0x%x value=%u\n", req_type, id, value);
++	return 0;
++}
++
++/*
++ * Clock control via RPM
++ */
++int
++surya_rpm_clk_enable(uint32_t clk_id)
++{
++	if (!surya_rpm_initialized)
++		return ENXIO;
++	
++	return rpm_smd_send_request(RPM_CLK_REQ, clk_id, 1); /* enable */
++}
++
++int
++surya_rpm_clk_disable(uint32_t clk_id)
++{
++	if (!surya_rpm_initialized)
++		return ENXIO;
++	
++	return rpm_smd_send_request(RPM_CLK_REQ, clk_id, 0); /* disable */
++}
++
++int
++surya_rpm_clk_set_rate(uint32_t clk_id, uint64_t rate_hz)
++{
++	if (!surya_rpm_initialized)
++		return ENXIO;
++	
++	return rpm_smd_send_request(RPM_CLK_REQ, clk_id, (uint32_t)(rate_hz / 1000000));
++}
++
++/*
++ * Power domain control via RPM
++ */
++int
++surya_rpm_power_domain_on(uint32_t pd_id)
++{
++	if (!surya_rpm_initialized)
++		return ENXIO;
++	
++	return rpm_smd_send_request(RPM_PWR_REQ, pd_id, 1);
++}
++
++int
++surya_rpm_power_domain_off(uint32_t pd_id)
++{
++	if (!surya_rpm_initialized)
++		return ENXIO;
++	
++	return rpm_smd_send_request(RPM_PWR_REQ, pd_id, 0);
++}
++
++/*
++ * Regulator control via RPM (controls PM8916 LDOs/SMPS)
++ */
++int
++surya_rpm_regulator_enable(uint32_t reg_id)
++{
++	if (!surya_rpm_initialized)
++		return ENXIO;
++	
++	return rpm_smd_send_request(RPM_REGULATOR_REQ, reg_id, 1);
++}
++
++int
++surya_rpm_regulator_disable(uint32_t reg_id)
++{
++	if (!surya_rpm_initialized)
++		return ENXIO;
++	
++	return rpm_smd_send_request(RPM_REGULATOR_REQ, reg_id, 0);
++}
++
++int
++surya_rpm_regulator_set_voltage(uint32_t reg_id, uint32_t min_uv, uint32_t max_uv)
++{
++	if (!surya_rpm_initialized)
++		return ENXIO;
++	
++	/* Send voltage request in mV */
++	return rpm_smd_send_request(RPM_REGULATOR_REQ, reg_id, (min_uv + max_uv) / 2000000);
++}
++
++/*
++ * Bus scaling via RPM
++ */
++int
++surya_rpm_bus_vote(uint32_t bus_id, uint32_t bw_kbps)
++{
++	if (!surya_rpm_initialized)
++		return ENXIO;
++	
++	return rpm_smd_send_request(RPM_BUS_REQ, bus_id, bw_kbps);
++}
++
++/*
++ * Initialize RPM
++ */
++int
++surya_rpm_init(void)
++{
++	if (surya_rpm_initialized)
++		return 0;
++	
++	/* Open SMD channel to RPM */
++	/* DTB: rpm@0 with qcom,ipc and qcom,smd-channels = "rpm_requests" */
++	/* This requires SMD driver which is complex. */
++	
++	/* For now, just mark as initialized and use PMIC directly for regulators */
++	surya_rpm_initialized = 1;
++	kprintf("SURYA RPM: Initialized (stub - using PMIC direct for regulators)\n");
++	
++	/* Enable essential clocks */
++	surya_rpm_clk_enable(RPM_CLK_MDSS_ESC0);
++	surya_rpm_clk_enable(RPM_CLK_DSI_CORE);
++	surya_rpm_clk_enable(RPM_CLK_DSI_BYTE);
++	surya_rpm_clk_enable(RPM_CLK_DSI_PIXEL);
++	surya_rpm_clk_enable(RPM_CLK_UFS_AXI);
++	surya_rpm_clk_enable(RPM_CLK_UFS_PHY);
++	
++	/* Enable power domains */
++	surya_rpm_power_domain_on(RPM_PD_MDSS);
++	surya_rpm_power_domain_on(RPM_PD_UFS);
++	
++	/* Enable essential regulators (via PMIC direct) */
++	/* LDO11 (touch), LDO15 (always on), SMPS3/4 (always on) */
++	
++	return 0;
++}
++
++/*
++ * Late init - after PMIC is ready
++ */
++int
++surya_rpm_late_init(void)
++{
++	if (!surya_rpm_initialized)
++		return ENXIO;
++	
++	/* Enable touch power rail (LDO11 on PM8916) */
++	surya_rpm_regulator_enable(RPM_REG_L11);
++	
++	/* Enable display power rails */
++	surya_rpm_regulator_enable(RPM_REG_L4);  /* VDDA for DSI PHY */
++	surya_rpm_regulator_enable(RPM_REG_L6);  /* VDDIO for DSI PHY (1.8V) */
++	
++	return 0;
++}
+diff --git a/bsd/dev/surya_rpm.h b/bsd/dev/surya_rpm.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/surya_rpm.h
+@@ -0,0 +1,55 @@
++/*
++ * Surya RPM (Resource Power Manager) interface
++ */
++#ifndef _SURYA_RPM_H_
++#define _SURYA_RPM_H_
++
++#include <sys/types.h>
++
++__BEGIN_DECLS
++
++int surya_rpm_init(void);
++int surya_rpm_late_init(void);
++
++/* Clocks */
++int surya_rpm_clk_enable(uint32_t clk_id);
++int surya_rpm_clk_disable(uint32_t clk_id);
++int surya_rpm_clk_set_rate(uint32_t clk_id, uint64_t rate_hz);
++
++/* Power domains */
++int surya_rpm_power_domain_on(uint32_t pd_id);
++int surya_rpm_power_domain_off(uint32_t pd_id);
++
++/* Regulators (PM8916 via RPM) */
++int surya_rpm_regulator_enable(uint32_t reg_id);
++int surya_rpm_regulator_disable(uint32_t reg_id);
++int surya_rpm_regulator_set_voltage(uint32_t reg_id, uint32_t min_uv, uint32_t max_uv);
++
++/* Bus scaling */
++int surya_rpm_bus_vote(uint32_t bus_id, uint32_t bw_kbps);
++
++__END_DECLS
++
++#endif /* _SURYA_RPM_H_ */
+diff --git a/bsd/dev/Makefile b/bsd/dev/Makefile
+--- a/bsd/dev/Makefile
++++ b/bsd/dev/Makefile
+@@ -10,6 +10,7 @@
+ 	sweet_keys.o \
+ 	sweet_touch.o \
+ 	sweet_ufs.o \
+ 	surya_pmic.o \
+ 	surya_display.o \
+ 	surya_keys.o \
+ 	surya_touch.o \
++	surya_rpm.o \
+ 	sweet_rpmh.o \
+ 	sweet_hid.o \
+ 	_sweet.o

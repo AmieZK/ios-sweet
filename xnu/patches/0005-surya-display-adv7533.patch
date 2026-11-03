@@ -1,0 +1,292 @@
+diff --git a/bsd/dev/surya_display.c b/bsd/dev/surya_display.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/surya_display.c
+@@ -0,0 +1,280 @@
++/*
++ * Display driver for surya (Poco X3 NFC) using ADV7533 HDMI bridge
++ * 
++ * Hardware:
++ * - MDSS (Mobile Display Subsystem) at 0x1a00000
++ * - DSI controller at 0x1a98000
++ * - DSI PHY at 0x1a98300
++ * - ADV7533 HDMI bridge on I2C4 (BLSP I2C @ 0x78b8000) address 0x39
++ * - Panel: 1080x2400 MIPI DSI -> ADV7533 -> HDMI (but phone uses internal panel)
++ * 
++ * Note: The ADV7533 is an HDMI transmitter. On surya it's likely used as
++ * a DSI-to-HDMI bridge for the internal panel, or the panel connects via
++ * the bridge. We need to configure the bridge and MDSS for 1080x2400.
++ */
++#include <sys/param.h>
++#include <sys/kernel.h>
++#include <sys/malloc.h>
++#include <sys/device.h>
++#include <sys/conf.h>
++#include <machine/bus.h>
++#include <arm/cpu.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/graphics/IOFramebuffer.h>
++#include <IOKit/graphics/IOGraphicsTypes.h>
++
++/* MDSS registers */
++#define MDSS_BASE			0x01a00000
++#define MDSS_SIZE			0x10000
++#define MDSS_VBIF_BASE		0x01ac8000
++#define MDSS_VBIF_SIZE		0x3000
++
++/* DSI controller */
++#define DSI_BASE			0x01a98000
++#define DSI_SIZE			0x25c
++
++/* DSI PHY */
++#define DSI_PHY_BASE		0x01a98300
++#define DSI_PHY_SIZE		0x00d4
++#define DSI_PHY_REG_SIZE	0x280
++#define DSI_PHY_REG_BASE	0x01a98780
++
++/* ADV7533 I2C address */
++#define ADV7533_I2C_ADDR		0x39
++#define ADV7533_I2C_BUS		4  /* BLSP I2C4 */
++
++/* Panel timing for 1080x2400 @60Hz */
++#define PANEL_H_ACTIVE		1080
++#define PANEL_V_ACTIVE		2400
++#define PANEL_H_FP		48
++#define PANEL_H_SYNC		32
++#define PANEL_H_BP		80
++#define PANEL_V_FP		16
++#define PANEL_V_SYNC		4
++#define PANEL_V_BP		20
++#define PANEL_PIXEL_CLK		345600000  /* ~345 MHz for 1080x2400@60 */
++
++static bus_space_tag_t mdss_iot;
++static bus_space_handle_t mdss_ioh;
++static bus_space_handle_t mdss_vbif_ioh;
++static bus_space_handle_t dsi_ioh;
++static bus_space_handle_t dsi_phy_ioh;
++static bus_space_handle_t dsi_phy_reg_ioh;
++
++static int surya_display_initialized = 0;
++
++/*
++ * I2C helper for ADV7533
++ */
++static int
++adv7533_i2c_read(uint8_t reg, uint8_t *val)
++{
++	/* Use platform I2C driver */
++	extern int pe_i2c_read(uint8_t bus, uint8_t addr, uint8_t reg, uint8_t *val);
++	return pe_i2c_read(ADV7533_I2C_BUS, ADV7533_I2C_ADDR, reg, val);
++}
++
++static int
++adv7533_i2c_write(uint8_t reg, uint8_t val)
++{
++	extern int pe_i2c_write(uint8_t bus, uint8_t addr, uint8_t reg, uint8_t val);
++	return pe_i2c_write(ADV7533_I2C_BUS, ADV7533_I2C_ADDR, reg, val);
++}
++
++/*
++ * ADV7533 initialization sequence
++ * Based on ADI reference scripts for DSI input -> HDMI output
++ */
++static int
++adv7533_init(void)
++{
++	/* Power up */
++	adv7533_i2c_write(0x41, 0x10); /* Power control: power up */
++	DELAY(5000);
++	
++	/* Input configuration: MIPI DSI 4-lane */
++	adv7533_i2c_write(0x15, 0x00); /* Input pixel mode */
++	adv7533_i2c_write(0x16, 0x38); /* DSI lane config: 4 lanes */
++	adv7533_i2c_write(0x17, 0x04); /* DSI lane mapping */
++	
++	/* Video timing */
++	adv7533_i2c_write(0x30, PANEL_H_ACTIVE & 0xff);
++	adv7533_i2c_write(0x31, PANEL_H_ACTIVE >> 8);
++	adv7533_i2c_write(0x32, PANEL_V_ACTIVE & 0xff);
++	adv7533_i2c_write(0x33, PANEL_V_ACTIVE >> 8);
++	
++	/* Hsync/Vsync */
++	adv7533_i2c_write(0x34, PANEL_H_FP);
++	adv7533_i2c_write(0x35, PANEL_H_SYNC);
++	adv7533_i2c_write(0x36, PANEL_H_BP);
++	adv7533_i2c_write(0x37, PANEL_V_FP);
++	adv7533_i2c_write(0x38, PANEL_V_SYNC);
++	adv7533_i2c_write(0x39, PANEL_V_BP);
++	
++	/* Pixel clock */
++	adv7533_i2c_write(0x3a, PANEL_PIXEL_CLK & 0xff);
++	adv7533_i2c_write(0x3b, (PANEL_PIXEL_CLK >> 8) & 0xff);
++	adv7533_i2c_write(0x3c, (PANEL_PIXEL_CLK >> 16) & 0xff);
++	
++	/* Output format: RGB 24-bit */
++	adv7533_i2c_write(0xaf, 0x06); /* HDMI output mode */
++	
++	/* Enable */
++	adv7533_i2c_write(0x41, 0x00); /* Power control: normal operation */
++	
++	kprintf("SURYA Display: ADV7533 initialized\n");
++	return 0;
++}
++
++/*
++ * MDSS initialization
++ */
++static int
++surya_mdss_init(void)
++{
++	mdss_iot = &arm_bus_space_generic;
++	
++	/* Map MDSS */
++	if (bus_space_map(mdss_iot, MDSS_BASE, MDSS_SIZE, 0, &mdss_ioh)) {
++		kprintf("SURYA Display: Failed to map MDSS\n");
++		return ENXIO;
++	}
++	
++	/* Map VBIF */
++	if (bus_space_map(mdss_iot, MDSS_VBIF_BASE, MDSS_VBIF_SIZE, 0, &mdss_vbif_ioh)) {
++		kprintf("SURYA Display: Failed to map VBIF\n");
++		return ENXIO;
++	}
++	
++	/* Map DSI controller */
++	if (bus_space_map(mdss_iot, DSI_BASE, DSI_SIZE, 0, &dsi_ioh)) {
++		kprintf("SURYA Display: Failed to map DSI\n");
++		return ENXIO;
++	}
++	
++	/* Map DSI PHY */
++	if (bus_space_map(mdss_iot, DSI_PHY_BASE, DSI_PHY_SIZE, 0, &dsi_phy_ioh)) {
++		kprintf("SURYA Display: Failed to map DSI PHY\n");
++		return ENXIO;
++	}
++	
++	if (bus_space_map(mdss_iot, DSI_PHY_REG_BASE, DSI_PHY_REG_SIZE, 0, &dsi_phy_reg_ioh)) {
++		kprintf("SURYA Display: Failed to map DSI PHY regs\n");
++		return ENXIO;
++	}
++	
++	/* Enable MDSS clocks */
++	/* TODO: Use RPM/RPMh to enable clocks */
++	
++	/* Configure VBIF */
++	bus_space_write_4(mdss_iot, mdss_vbif_ioh, 0x0, 0x1); /* VBIF enable */
++	
++	/* Configure DSI controller */
++	bus_space_write_4(mdss_iot, dsi_ioh, 0x0, 0x1); /* DSI enable */
++	
++	/* DSI PHY init */
++	bus_space_write_4(mdss_iot, dsi_phy_ioh, 0x0, 0x1); /* PHY enable */
++	
++	kprintf("SURYA Display: MDSS/DSI initialized\n");
++	return 0;
++}
++
++/*
++ * Framebuffer setup
++ * The ABL leaves a framebuffer at 0x9c000000 (same as sweet)
++ */
++void
++surya_display_setup_framebuffer(void *fb_base, uint32_t width, uint32_t height, uint32_t stride)
++{
++	/* Configure MDSS layer mixer for the framebuffer */
++	/* This is a simplified version - real implementation needs layer config */
++	
++	/* Set source image size */
++	bus_space_write_4(mdss_iot, mdss_ioh, 0x200, width);  /* SRC_WIDTH */
++	bus_space_write_4(mdss_iot, mdss_ioh, 0x204, height); /* SRC_HEIGHT */
++	bus_space_write_4(mdss_iot, mdss_ioh, 0x208, stride); /* SRC_STRIDE */
++	
++	/* Set destination (panel) size */
++	bus_space_write_4(mdss_iot, mdss_ioh, 0x210, PANEL_H_ACTIVE); /* DST_WIDTH */
++	bus_space_write_4(mdss_iot, mdss_ioh, 0x214, PANEL_V_ACTIVE); /* DST_HEIGHT */
++	
++	/* Set framebuffer address */
++	bus_space_write_4(mdss_iot, mdss_ioh, 0x220, (uint32_t)fb_base); /* FB_ADDR */
++	bus_space_write_4(mdss_iot, mdss_ioh, 0x224, (uint32_t)((uint64_t)fb_base >> 32));
++	
++	/* Enable layer */
++	bus_space_write_4(mdss_iot, mdss_ioh, 0x230, 0x1);
++	
++	kprintf("SURYA Display: Framebuffer configured at %p %dx%d stride=%d\n",
++	        fb_base, width, height, stride);
++}
++
++/*
++ * Main display initialization
++ */
++int
++surya_display_init(void)
++{
++	if (surya_display_initialized)
++		return 0;
++	
++	int err = surya_mdss_init();
++	if (err)
++		return err;
++	
++	err = adv7533_init();
++	if (err)
++		return err;
++	
++	surya_display_initialized = 1;
++	kprintf("SURYA Display: Initialized (1080x2400)\n");
++	return 0;
++}
++
++/*
++ * Power control (for sleep/wake)
++ */
++int
++surya_display_power(int on)
++{
++	if (on) {
++		/* Power on sequence */
++		adv7533_i2c_write(0x41, 0x00); /* ADV7533 power on */
++		bus_space_write_4(mdss_iot, dsi_ioh, 0x0, 0x1); /* DSI enable */
++		bus_space_write_4(mdss_iot, dsi_phy_ioh, 0x0, 0x1); /* PHY enable */
++	} else {
++		/* Power off sequence */
++		bus_space_write_4(mdss_iot, dsi_ioh, 0x0, 0x0); /* DSI disable */
++		bus_space_write_4(mdss_iot, dsi_phy_ioh, 0x0, 0x0); /* PHY disable */
++		adv7533_i2c_write(0x41, 0x10); /* ADV7533 power down */
++	}
++	return 0;
++}
+diff --git a/bsd/dev/surya_display.h b/bsd/dev/surya_display.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/surya_display.h
+@@ -0,0 +1,50 @@
++/*
++ * Surya display driver interface
++ */
++#ifndef _SURYA_DISPLAY_H_
++#define _SURYA_DISPLAY_H_
++
++#include <sys/types.h>
++
++__BEGIN_DECLS
++
++int surya_display_init(void);
++void surya_display_setup_framebuffer(void *fb_base, uint32_t width, uint32_t height, uint32_t stride);
++int surya_display_power(int on);
++
++__END_DECLS
++
++#endif /* _SURYA_DISPLAY_H_ */
+diff --git a/bsd/dev/Makefile b/bsd/dev/Makefile
+--- a/bsd/dev/Makefile
++++ b/bsd/dev/Makefile
+@@ -10,6 +10,7 @@
+ 	sweet_keys.o \
+ 	sweet_touch.o \
+ 	sweet_ufs.o \
+ 	surya_pmic.o \
++	surya_display.o \
+ 	sweet_rpmh.o \
+ 	sweet_hid.o \
+ 	_sweet.o

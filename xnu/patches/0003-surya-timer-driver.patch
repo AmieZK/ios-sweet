@@ -1,0 +1,132 @@
+diff --git a/osfmk/arm/arm_timer.c b/osfmk/arm/arm_timer.c
+--- a/osfmk/arm/arm_timer.c
++++ b/osfmk/arm/arm_timer.c
+@@ -100,6 +100,50 @@ arm_timer_init(void)
+ 	}
+ }
+ 
++#if defined(SURYA)
++/*
++ * SURYA ARMv7 Timer Driver
++ * 
++ * Surya uses ARMv7 timer memory-mapped at 0x0b020000 with frames:
++ * Frame 0 (0xb021000): Secure physical timer - PPI 8
++ * Frame 1 (0xb022000): Non-secure physical timer - PPI 9  
++ * Frame 2 (0xb023000): Hyp physical timer - PPI 10 (disabled)
++ * Frame 3 (0xb024000): Virtual timer - PPI 11 (INTID 27) <- we use this
++ * 
++ * Each frame has: CTL (0x0), VAL (0x4), CVL (0x8), CVU (0xc)
++ * We use the system generic timer registers (CNTV_*) via system registers
++ * but also need the memory-mapped frame for initialization.
++ */
++#include <arm/arm_timer.h>
++#include <arm/machine_cpu.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++
++static volatile uint32_t *surya_timer_base = NULL;
++
++void
++surya_timer_init(void)
++{
++	/* Map the ARMv7 timer frame (virtual timer at frame 3 = offset 0x4000) */
++	/* DTB shows timer@b020000 with frames at b021000, b023000, b024000, b025000, b026000, b027000, b028000 */
++	/* Frame 3 (virtual timer) is at 0xb024000 */
++	surya_timer_base = (volatile uint32_t *)phystokv(0x0b024000);
++	
++	if (surya_timer_base) {
++		/* Disable timer initially */
++		surya_timer_base[0] = 0; /* CTL = 0 */
++		kprintf("SURYA: ARMv7 timer mapped at %p\n", surya_timer_base);
++	}
++}
++
++uint64_t
++surya_timer_read_cntvct(void)
++{
++	/* Read virtual timer count from system register (preferred) */
++	return __builtin_arm_rsr64("CNTVCT_EL0");
++}
++
++void
++surya_timer_set_next_event(uint64_t delta_ns)
++{
++	uint64_t freq = 19200000; /* 19.2 MHz from DTB */
++	uint64_t ticks = (delta_ns * freq) / 1000000000ULL;
++	
++	/* Set via system register */
++	__builtin_arm_wsr64("CNTV_TVAL_EL0", (uint32_t)ticks);
++	__builtin_arm_wsr64("CNTV_CTL_EL0", 1); /* Enable */
++	__builtin_arm_isb(ISB_SY);
++}
++
++void
++surya_timer_cancel(void)
++{
++	__builtin_arm_wsr64("CNTV_CTL_EL0", 0); /* Disable */
++	__builtin_arm_isb(ISB_SY);
++}
++#endif /* SURYA */
++
+ #if defined(CONFIG_BCM2837)
+ /* BCM2837 timer implementation... */
+ #endif
+diff --git a/osfmk/arm/arm_timer.h b/osfmk/arm/arm_timer.h
+--- a/osfmk/arm/arm_timer.h
++++ b/osfmk/arm/arm_timer.h
+@@ -50,6 +50,16 @@
+ extern void arm_timer_rearm(void);
+ extern void arm_timer_cancel(void);
+ 
++#if defined(SURYA)
++extern void surya_timer_init(void);
++extern uint64_t surya_timer_read_cntvct(void);
++extern void surya_timer_set_next_event(uint64_t delta_ns);
++extern void surya_timer_cancel(void);
++#endif
++
+ #endif /* _ARM_ARM_TIMER_H_ */
+diff --git a/osfmk/kern/clock.c b/osfmk/kern/clock.c
+--- a/osfmk/kern/clock.c
++++ b/osfmk/kern/clock.c
+@@ -500,6 +500,12 @@ clock_init(void)
+ 	}
+ 
++#if defined(SURYA)
++	surya_timer_init();
++	/* Use generic timer functions via system registers */
++#endif
++
+ 	/* Initialize the clock subsystem */
+ 	clock_interval_init();
+ 	clock_absolutetime_init();
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -200,6 +200,12 @@ pe_init(void)
+ 	}
+ 
++#if defined(SURYA)
++	/* Surya timer initialization is done in clock_init() */
++	/* but we can also set up the memory-mapped frame here if needed */
++#endif
++
+ 	/* Initialize the platform expert */
+ 	PE_init_kprintf(TRUE);
+ 
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1867,7 +1867,11 @@ sleh_irq(arm_saved_state_t *state)
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+ 	}
+-	if (intid == SWEET_VTIMER_INTID) {
++#if defined(SURYA)
++	if (intid == surya_vtimer_intid) {
++#elif defined(SWEET)
++	if (intid == sweet_vtimer_intid) {
++#endif
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);

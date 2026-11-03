@@ -1,0 +1,354 @@
+diff --git a/bsd/dev/surya_touch.c b/bsd/dev/surya_touch.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/surya_touch.c
+@@ -0,0 +1,400 @@
++/*
++ * Touch driver for surya (Poco X3 NFC)
++ * 
++ * Supports common touch controllers found on Xiaomi devices:
++ * - Goodix GT911/GT9896 (I2C addr 0x5d, 0x14)
++ * - FocalTech FTxxxx (I2C addr 0x38, 0x70)
++ * 
++ * Probes I2C buses: BLSP I2C2 (bus 2), I2C4 (bus 4), I2C6 (bus 6)
++ * 
++ * DTB shows:
++ * - i2c@78b6000 (BLSP I2C2) - bus 2
++ * - i2c@78b8000 (BLSP I2C4) - bus 4 (has ADV7533 at 0x39)
++ * - i2c@78ba000 (BLSP I2C6) - bus 6
++ * 
++ * Touch controller typically on I2C2 or I2C6.
++ */
++#include <sys/param.h>
++#include <sys/kernel.h>
++#include <sys/malloc.h>
++#include <sys/device.h>
++#include <sys/conf.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <machine/bus.h>
++#include <arm/cpu.h>
++#include <pexpert/pexpert.h>
++#include <IOKit/hidsystem/IOHIDTypes.h>
++#include <IOKit/hidsystem/ev_keymap.h>
++
++/* Touch controller types */
++#define TOUCH_GOODIX		1
++#define TOUCH_FOCALTECH		2
++
++/* Goodix registers */
++#define GOODIX_CONFIG_VERSION	0x8047
++#define GOODIX_FIRMWARE_VERSION	0x8048
++#define GOODIX_TOUCH_POINTS	0x8050
++#define GOODIX_TOUCH1_X		0x8051
++#define GOODIX_TOUCH1_Y		0x8053
++#define GOODIX_TOUCH1_SIZE	0x8055
++#define GOODIX_GESTURE		0x8060
++#define GOODIX_GESTURE_DATA	0x8061
++
++/* FocalTech registers */
++#define FT_CHIP_ID		0xA3
++#define FT_FIRMWARE_VERSION	0xA6
++#define FT_TOUCH_POINTS		0x02
++#define FT_TOUCH1_XH		0x03
++#define FT_TOUCH1_XL		0x04
++#define FT_TOUCH1_YH		0x05
++#define FT_TOUCH1_YL		0x06
++
++/* I2C bus numbers (from DTB aliases) */
++#define I2C_BUS_BLSP2		2  /* i2c@78b6000 */
++#define I2C_BUS_BLSP4		4  /* i2c@78b8000 */
++#define I2C_BUS_BLSP6		6  /* i2c@78ba000 */
++
++/* Touch panel resolution */
++#define TOUCH_MAX_X		1080
++#define TOUCH_MAX_Y		2400
++
++static struct touch_controller {
++	int type;
++	uint8_t i2c_bus;
++	uint8_t i2c_addr;
++	int initialized;
++	int irq_gpio;  /* Interrupt GPIO if available */
++} surya_touch_ctrl = {0};
++
++/* HID callback */
++static void (*surya_hid_touch_callback)(int finger, int down, int x, int y) = NULL;
++
++void
++surya_touch_set_callback(void (*cb)(int, int, int, int))
++{
++	surya_hid_touch_callback = cb;
++}
++
++/*
++ * I2C read/write via platform expert
++ */
++static int
++touch_i2c_read(uint8_t bus, uint8_t addr, uint16_t reg, uint8_t *buf, int len)
++{
++	extern int pe_i2c_read(uint8_t bus, uint8_t addr, uint16_t reg, uint8_t *buf, int len);
++	return pe_i2c_read(bus, addr, reg, buf, len);
++}
++
++static int
++touch_i2c_write(uint8_t bus, uint8_t addr, uint16_t reg, uint8_t *buf, int len)
++{
++	extern int pe_i2c_write(uint8_t bus, uint8_t addr, uint16_t reg, uint8_t *buf, int len);
++	return pe_i2c_write(bus, addr, reg, buf, len);
++}
++
++/*
++ * Goodix GT911/GT9896 detection and init
++ */
++static int
++goodix_probe(uint8_t bus, uint8_t addr)
++{
++	uint8_t buf[4];
++	
++	/* Read config version (2 bytes) */
++	if (touch_i2c_read(bus, addr, GOODIX_CONFIG_VERSION, buf, 2) != 0)
++		return -1;
++	
++	/* Read firmware version */
++	if (touch_i2c_read(bus, addr, GOODIX_FIRMWARE_VERSION, buf, 2) != 0)
++		return -1;
++	
++	kprintf("SURYA Touch: Goodix detected at bus %d addr 0x%02x, config_ver=0x%02x%02x, fw_ver=0x%02x%02x\n",
++	        bus, addr, buf[1], buf[0], buf[1], buf[0]);
++	
++	/* Soft reset */
++	buf[0] = 0x02;
++	touch_i2c_write(bus, addr, 0x8040, buf, 1);
++	DELAY(10000);
++	
++	/* Enable interrupt mode */
++	buf[0] = 0x00; /* INT trigger mode: rising edge */
++	touch_i2c_write(bus, addr, 0x8042, buf, 1);
++	
++	return 0;
++}
++
++static void
++goodix_read_touch(uint8_t bus, uint8_t addr)
++{
++	uint8_t buf[8];
++	
++	/* Read touch points */
++	if (touch_i2c_read(bus, addr, GOODIX_TOUCH_POINTS, buf, 1) != 0)
++		return;
++	
++	int points = buf[0] & 0x0F;
++	if (points == 0) {
++		/* No touch - check if we need to report release */
++		static int last_down = 0;
++		if (last_down && surya_hid_touch_callback) {
++			surya_hid_touch_callback(0, 0, 0, 0);
++			last_down = 0;
++		}
++		return;
++	}
++	
++	/* Read first touch point (5 bytes: status, x_low, x_high, y_low, y_high) */
++	if (touch_i2c_read(bus, addr, GOODIX_TOUCH1_X, buf, 5) != 0)
++		return;
++	
++	int x = buf[1] | (buf[2] << 8);
++	int y = buf[3] | (buf[4] << 8);
++	
++	/* Clear buffer */
++	buf[0] = 0x00;
++	touch_i2c_write(bus, addr, GOODIX_TOUCH_POINTS, buf, 1);
++	
++	if (surya_hid_touch_callback) {
++		surya_hid_touch_callback(1, 1, x, y);
++	}
++}
++
++/*
++ * FocalTech detection and init
++ */
++static int
++focaltech_probe(uint8_t bus, uint8_t addr)
++{
++	uint8_t buf[2];
++	
++	/* Read chip ID */
++	if (touch_i2c_read(bus, addr, FT_CHIP_ID, buf, 1) != 0)
++		return -1;
++	
++	kprintf("SURYA Touch: FocalTech detected at bus %d addr 0x%02x, chip_id=0x%02x\n",
++	        bus, addr, buf[0]);
++	
++	/* Read firmware version */
++	touch_i2c_read(bus, addr, FT_FIRMWARE_VERSION, buf, 1);
++	kprintf("SURYA Touch: FocalTech fw_ver=0x%02x\n", buf[0]);
++	
++	return 0;
++}
++
++static void
++focaltech_read_touch(uint8_t bus, uint8_t addr)
++{
++	uint8_t buf[6];
++	
++	/* Read touch points */
++	if (touch_i2c_read(bus, addr, FT_TOUCH_POINTS, buf, 1) != 0)
++		return;
++	
++	int points = buf[0] & 0x0F;
++	if (points == 0) {
++		static int last_down = 0;
++		if (last_down && surya_hid_touch_callback) {
++			surya_hid_touch_callback(0, 0, 0, 0);
++			last_down = 0;
++		}
++		return;
++	}
++	
++	/* Read first touch point */
++	if (touch_i2c_read(bus, addr, FT_TOUCH1_XH, buf, 4) != 0)
++		return;
++	
++	int x = ((buf[0] & 0x0F) << 8) | buf[1];
++	int y = ((buf[2] & 0x0F) << 8) | buf[3];
++	
++	if (surya_hid_touch_callback) {
++		surya_hid_touch_callback(1, 1, x, y);
++	}
++}
++
++/*
++ * Probe for touch controller on all buses
++ */
++static int
++surya_touch_probe(void)
++{
++	/* Common touch controller addresses to probe */
++	struct { uint8_t bus; uint8_t addr; int type; } probes[] = {
++		{ I2C_BUS_BLSP2, 0x5d, TOUCH_GOODIX },    /* Goodix GT911/GT9896 */
++		{ I2C_BUS_BLSP2, 0x14, TOUCH_GOODIX },    /* Goodix alt addr */
++		{ I2C_BUS_BLSP2, 0x38, TOUCH_FOCALTECH }, /* FocalTech */
++		{ I2C_BUS_BLSP2, 0x70, TOUCH_FOCALTECH }, /* FocalTech alt */
++		{ I2C_BUS_BLSP4, 0x5d, TOUCH_GOODIX },
++		{ I2C_BUS_BLSP4, 0x14, TOUCH_GOODIX },
++		{ I2C_BUS_BLSP4, 0x38, TOUCH_FOCALTECH },
++		{ I2C_BUS_BLSP4, 0x70, TOUCH_FOCALTECH },
++		{ I2C_BUS_BLSP6, 0x5d, TOUCH_GOODIX },
++		{ I2C_BUS_BLSP6, 0x14, TOUCH_GOODIX },
++		{ I2C_BUS_BLSP6, 0x38, TOUCH_FOCALTECH },
++		{ I2C_BUS_BLSP6, 0x70, TOUCH_FOCALTECH },
++		{ 0, 0, 0 } /* terminator */
++	};
++	
++	for (int i = 0; probes[i].bus != 0; i++) {
++		if (probes[i].type == TOUCH_GOODIX) {
++			if (goodix_probe(probes[i].bus, probes[i].addr) == 0) {
++				surya_touch_ctrl.type = TOUCH_GOODIX;
++				surya_touch_ctrl.i2c_bus = probes[i].bus;
++				surya_touch_ctrl.i2c_addr = probes[i].addr;
++				surya_touch_ctrl.initialized = 1;
++				kprintf("SURYA Touch: Goodix found on bus %d addr 0x%02x\n",
++				        probes[i].bus, probes[i].addr);
++				return 0;
++			}
++		} else if (probes[i].type == TOUCH_FOCALTECH) {
++			if (focaltech_probe(probes[i].bus, probes[i].addr) == 0) {
++				surya_touch_ctrl.type = TOUCH_FOCALTECH;
++				surya_touch_ctrl.i2c_bus = probes[i].bus;
++				surya_touch_ctrl.i2c_addr = probes[i].addr;
++				surya_touch_ctrl.initialized = 1;
++				kprintf("SURYA Touch: FocalTech found on bus %d addr 0x%02x\n",
++				        probes[i].bus, probes[i].addr);
++				return 0;
++			}
++		}
++	}
++	
++	kprintf("SURYA Touch: No touch controller found\n");
++	return ENXIO;
++}
++
++/*
++ * Touch interrupt handler (called from GPIO interrupt)
++ */
++void
++surya_touch_interrupt(void)
++{
++	if (!surya_touch_ctrl.initialized)
++		return;
++	
++	if (surya_touch_ctrl.type == TOUCH_GOODIX) {
++		goodix_read_touch(surya_touch_ctrl.i2c_bus, surya_touch_ctrl.i2c_addr);
++	} else if (surya_touch_ctrl.type == TOUCH_FOCALTECH) {
++		focaltech_read_touch(surya_touch_ctrl.i2c_bus, surya_touch_ctrl.i2c_addr);
++	}
++}
++
++/*
++ * Polling mode (if interrupt not available)
++ */
++void
++surya_touch_poll(void)
++{
++	surya_touch_interrupt();
++}
++
++/*
++ * Main touch initialization
++ */
++int
++surya_touch_init(void)
++{
++	if (surya_touch_ctrl.initialized)
++		return 0;
++	
++	int err = surya_touch_probe();
++	if (err) {
++		kprintf("SURYA Touch: Failed to find touch controller\n");
++		return err;
++	}
++	
++	/* TODO: Configure interrupt GPIO if available */
++	
++	kprintf("SURYA Touch: Initialized (type=%d, bus=%d, addr=0x%02x)\n",
++	        surya_touch_ctrl.type, surya_touch_ctrl.i2c_bus, surya_touch_ctrl.i2c_addr);
++	return 0;
++}
+diff --git a/bsd/dev/surya_touch.h b/bsd/dev/surya_touch.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/surya_touch.h
+@@ -0,0 +1,45 @@
++/*
++ * Surya touch driver interface
++ */
++#ifndef _SURYA_TOUCH_H_
++#define _SURYA_TOUCH_H_
++
++#include <sys/types.h>
++
++__BEGIN_DECLS
++
++int surya_touch_init(void);
++void surya_touch_set_callback(void (*cb)(int, int, int, int));
++void surya_touch_interrupt(void);
++void surya_touch_poll(void);
++
++__END_DECLS
++
++#endif /* _SURYA_TOUCH_H_ */
+diff --git a/bsd/dev/Makefile b/bsd/dev/Makefile
+--- a/bsd/dev/Makefile
++++ b/bsd/dev/Makefile
+@@ -10,6 +10,7 @@
+ 	sweet_keys.o \
+ 	sweet_touch.o \
+ 	sweet_ufs.o \
+ 	surya_pmic.o \
+ 	surya_display.o \
+ 	surya_keys.o \
++	surya_touch.o \
+ 	sweet_rpmh.o \
+ 	sweet_hid.o \
+ 	_sweet.o

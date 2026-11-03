@@ -1,0 +1,62 @@
+name: xnu-surya
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: 'Machine config'
+        required: true
+        default: 'SURYA'
+        type: choice
+        options:
+          - SURYA
+
+jobs:
+  build:
+    name: Build xnu kernel for SURYA
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up toolchain
+        run: |
+          brew install aarch64-elf-binutils aarch64-elf-gcc ccache ninja python3
+          python3 -m pip install --user pyaml
+
+      - name: Apply patches
+        run: |
+          cd xnu
+          # Apply all patches in order
+          for patch in ../xnu/patches/*.patch; do
+            if [[ "$patch" == *"surya"* ]] || [[ "$patch" == *"sweet"* ]]; then
+              echo "Applying $patch"
+              git apply --whitespace=nowarn "$patch" || exit 1
+            fi
+          done
+
+      - name: Configure kernel
+        run: |
+          cd xnu
+          export CURRENT_MACHINE_CONFIG=SURYA
+          export ARCH_CONFIGS=SURYA
+          make clean
+          ./configure --enable-debug --enable-kasan --disable-werror SURYA
+
+      - name: Build kernel
+        run: |
+          cd xnu
+          export CURRENT_MACHINE_CONFIG=SURYA
+          make -j$(sysctl -n hw.ncpu) kernel
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xnu-kernel-surya
+          path: |
+            xnu/BUILD/obj/arm64/SURYA/kernel.development.surya
+            xnu/BUILD/obj/arm64/SURYA/kernel.development.surya.dSYM
+          retention-days: 30

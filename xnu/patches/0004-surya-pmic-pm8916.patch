@@ -1,0 +1,435 @@
+diff --git a/bsd/dev/surya_pmic.c b/bsd/dev/surya_pmic.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/surya_pmic.c
+@@ -0,0 +1,320 @@
++/*
++ * PMIC driver for Qualcomm PM8916 (used in surya/Poco X3 NFC)
++ * 
++ * PM8916 registers accessed via SPMI (System Power Management Interface).
++ * SPMI controller at 0x200f000 (from DTB).
++ * PMIC slave IDs: 0 (primary), 1 (secondary).
++ * 
++ * Key registers:
++ * - PWRKEY (power button): @0x800, IRQ via SPMI
++ * - GPIOs: @0xc000 (16 GPIOs), @0xa000 (MPPs)
++ * - Regulators: LDOs (L1-L18), SMPS (S1-S4)
++ * - RTC: @0x6000
++ * - VADC: @0x3100 (voltage ADC for battery monitoring)
++ * - Temp alarm: @0x2400
++ */
++#include <sys/param.h>
++#include <sys/kernel.h>
++#include <sys/malloc.h>
++#include <sys/device.h>
++#include <sys/conf.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <machine/bus.h>
++#include <arm/cpu.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm/pe_spmi.h>
++
++/* SPMI PMIC arbiter registers */
++#define SPMI_BASE			0x0200f000
++#define SPMI_CORE_SIZE		0x1000
++#define SPMI_CHNL_SIZE		0x4000
++#define SPMI_OBSRVR_SIZE	0x4000
++#define SPMI_INTR_SIZE		0x4000
++#define SPMI_CNFG_SIZE		0x2000
++
++/* PM8916 register addresses (per slave) */
++#define PM8916_PWRKEY		0x0800
++#define PM8916_RTC		0x6000
++#define PM8916_GPIOS		0xc000
++#define PM8916_MPPS		0xa000
++#define PM8916_TEMP_ALARM	0x2400
++#define PM8916_VADC		0x3100
++#define PM8916_CODEC		0xf000
++
++/* SPMI commands */
++#define SPMI_CMD_EXT_READL	0x01
++#define SPMI_CMD_EXT_WRITEL	0x02
++#define SPMI_CMD_READ		0x03
++#define SPMI_CMD_WRITE		0x04
++
++/* PMIC slave IDs on surya */
++#define PM8916_SID_PRIMARY	0
++#define PM8916_SID_SECONDARY	1
++
++static bus_space_tag_t spmi_iot;
++static bus_space_handle_t spmi_ioh;
++static bus_space_handle_t spmi_chnl_ioh;
++static bus_space_handle_t spmi_cnfg_ioh;
++
++static int pm8916_initialized = 0;
++
++/*
++ * SPMI read/write helpers
++ */
++static int
++spmi_read_sid_reg(uint8_t sid, uint16_t addr, uint8_t *val)
++{
++	uint32_t cmd = SPMI_CMD_EXT_READL | (sid << 4) | ((addr >> 8) & 0x7) << 8 | (addr & 0xff) << 16;
++	bus_space_write_4(spmi_iot, spmi_chnl_ioh, 0x00, cmd);
++	bus_space_write_4(spmi_iot, spmi_chnl_ioh, 0x04, 1); /* length */
++	bus_space_write_4(spmi_iot, spmi_chnl_ioh, 0x08, 1); /* trigger */
++	
++	/* Wait for completion */
++	for (int i = 0; i < 10000; i++) {
++		uint32_t status = bus_space_read_4(spmi_iot, spmi_chnl_ioh, 0x0c);
++		if (status & 0x1) break;
++		DELAY(10);
++	}
++	
++	uint32_t result = bus_space_read_4(spmi_iot, spmi_chnl_ioh, 0x10);
++	*val = result & 0xff;
++	return 0;
++}
++
++static int
++spmi_write_sid_reg(uint8_t sid, uint16_t addr, uint8_t val)
++{
++	uint32_t cmd = SPMI_CMD_EXT_WRITEL | (sid << 4) | ((addr >> 8) & 0x7) << 8 | (addr & 0xff) << 16;
++	bus_space_write_4(spmi_iot, spmi_chnl_ioh, 0x00, cmd);
++	bus_space_write_4(spmi_iot, spmi_chnl_ioh, 0x04, 1); /* length */
++	bus_space_write_4(spmi_iot, spmi_chnl_ioh, 0x14, val); /* data */
++	bus_space_write_4(spmi_iot, spmi_chnl_ioh, 0x08, 1); /* trigger */
++	
++	/* Wait for completion */
++	for (int i = 0; i < 10000; i++) {
++		uint32_t status = bus_space_read_4(spmi_iot, spmi_chnl_ioh, 0x0c);
++		if (status & 0x1) break;
++		DELAY(10);
++	}
++	return 0;
++}
++
++/*
++ * Power key (PWRKEY) handling
++ * Register: 0x800 on primary PMIC (SID 0)
++ * Interrupt: SPMI interrupt from PMIC
++ */
++static void
++surya_pmic_pwrkey_handler(void *arg)
++{
++	uint8_t status;
++	spmi_read_sid_reg(PM8916_SID_PRIMARY, PM8916_PWRKEY, &status);
++	
++	/* Bit 0: PWRKEY press detected */
++	if (status & 0x1) {
++		kprintf("SURYA PMIC: Power key pressed\n");
++		/* Send HID event for power button */
++		/* TODO: integrate with IOHID */
++	}
++	
++	/* Clear interrupt */
++	spmi_write_sid_reg(PM8916_SID_PRIMARY, PM8916_PWRKEY, status);
++}
++
++/*
++ * Initialize PM8916 PMIC
++ */
++int
++surya_pmic_init(void)
++{
++	if (pm8916_initialized)
++		return 0;
++	
++	/* Map SPMI registers */
++	spmi_iot = &arm_bus_space_generic;
++	if (bus_space_map(spmi_iot, SPMI_BASE, SPMI_CORE_SIZE + SPMI_CHNL_SIZE + SPMI_CNFG_SIZE, 0, &spmi_ioh)) {
++		kprintf("SURYA PMIC: Failed to map SPMI core\n");
++		return ENXIO;
++	}
++	spmi_chnl_ioh = spmi_ioh + SPMI_CORE_SIZE;
++	spmi_cnfg_ioh = spmi_ioh + SPMI_CORE_SIZE + SPMI_CHNL_SIZE;
++	
++	/* Configure SPMI channels for PMIC SIDs */
++	bus_space_write_4(spmi_iot, spmi_cnfg_ioh, 0x00, PM8916_SID_PRIMARY); /* Channel 0 -> SID 0 */
++	bus_space_write_4(spmi_iot, spmi_cnfg_ioh, 0x04, PM8916_SID_SECONDARY); /* Channel 1 -> SID 1 */
++	
++	/* Enable PWRKEY interrupt */
++	spmi_write_sid_reg(PM8916_SID_PRIMARY, PM8916_PWRKEY + 0x4, 0x1); /* Interrupt enable */
++	
++	/* Register interrupt handler */
++	/* TODO: hook up SPMI interrupt (DTB shows interrupt 0xbe for SPMI) */
++	
++	pm8916_initialized = 1;
++	kprintf("SURYA PMIC: PM8916 initialized\n");
++	return 0;
++}
++
++/*
++ * Read VADC channel (for battery voltage, temperature, etc.)
++ * Channel 0: USB_IN, 7: VPH_PWR, 8: DIE_TEMP, etc.
++ */
++int
++surya_pmic_vadc_read(uint8_t channel, uint16_t *result)
++{
++	if (!pm8916_initialized)
++		return ENXIO;
++	
++	/* Select channel */
++	spmi_write_sid_reg(PM8916_SID_PRIMARY, PM8916_VADC + 0x0, channel);
++	
++	/* Start conversion */
++	spmi_write_sid_reg(PM8916_SID_PRIMARY, PM8916_VADC + 0x1, 0x1);
++	
++	/* Wait for conversion */
++	DELAY(1000);
++	
++	/* Read result (2 bytes) */
++	uint8_t lo, hi;
++	spmi_read_sid_reg(PM8916_SID_PRIMARY, PM8916_VADC + 0x4, &lo);
++	spmi_read_sid_reg(PM8916_SID_PRIMARY, PM8916_VADC + 0x5, &hi);
++	*result = (hi << 8) | lo;
++	
++	return 0;
++}
++
++/*
++ * GPIO control via PMIC GPIOs and MPPs
++ */
++int
++surya_pmic_gpio_config(uint8_t gpio, uint8_t config)
++{
++	if (!pm8916_initialized)
++		return ENXIO;
++	
++	if (gpio < 16) {
++		/* GPIOs @ 0xc000 */
++		spmi_write_sid_reg(PM8916_SID_PRIMARY, PM8916_GPIOS + gpio * 2, config);
++		spmi_write_sid_reg(PM8916_SID_PRIMARY, PM8916_GPIOS + gpio * 2 + 1, config >> 8);
++	} else if (gpio < 20) {
++		/* MPPs @ 0xa000 (4 MPPs) */
++		uint8_t mpp = gpio - 16;
++		spmi_write_sid_reg(PM8916_SID_PRIMARY, PM8916_MPPS + mpp * 2, config);
++		spmi_write_sid_reg(PM8916_SID_PRIMARY, PM8916_MPPS + mpp * 2 + 1, config >> 8);
++	} else {
++		return EINVAL;
++	}
++	return 0;
++}
++
++int
++surya_pmic_gpio_read(uint8_t gpio, uint8_t *val)
++{
++	if (!pm8916_initialized)
++		return ENXIO;
++	
++	if (gpio < 16) {
++		spmi_read_sid_reg(PM8916_SID_PRIMARY, PM8916_GPIOS + gpio * 2, val);
++	} else if (gpio < 20) {
++		uint8_t mpp = gpio - 16;
++		spmi_read_sid_reg(PM8916_SID_PRIMARY, PM8916_MPPS + mpp * 2, val);
++	} else {
++		return EINVAL;
++	}
++	return 0;
++}
++
++int
++surya_pmic_gpio_write(uint8_t gpio, uint8_t val)
++{
++	if (!pm8916_initialized)
++		return ENXIO;
++	
++	if (gpio < 16) {
++		spmi_write_sid_reg(PM8916_SID_PRIMARY, PM8916_GPIOS + gpio * 2, val);
++	} else if (gpio < 20) {
++		uint8_t mpp = gpio - 16;
++		spmi_write_sid_reg(PM8916_SID_PRIMARY, PM8916_MPPS + mpp * 2, val);
++	} else {
++		return EINVAL;
++	}
++	return 0;
++}
++
++/*
++ * Battery voltage reading via VADC
++ * VPH_PWR channel (channel 7) measures battery voltage
++ * Pre-scaling: 1:10 according to DTB
++ */
++uint32_t
++surya_pmic_get_battery_voltage_mv(void)
++{
++	uint16_t raw;
++	if (surya_pmic_vadc_read(7, &raw) != 0)
++		return 0;
++	
++	/* Convert: VADC is 12-bit (0-4095), reference 1.25V or 6.25mV?
++	 * DTB shows vph_pwr with pre-scaling 1:10
++	 * Reference voltage from DTB: ref_1250v (1.25V = 1250mV)
++	 * Formula: voltage = (raw / 4096) * 1250mV * 10 (pre-scaling)
++	 */
++	uint32_t voltage_mv = (raw * 12500ULL) / 4096;
++	return voltage_mv;
++}
++
++/*
++ * Die temperature reading
++ */
++int32_t
++surya_pmic_get_die_temp_c(void)
++{
++	uint16_t raw;
++	if (surya_pmic_vadc_read(8, &raw) != 0)
++		return -273;
++	
++	/* Convert die temp - need calibration from QFUSE */
++	/* For now return raw */
++	return (int32_t)raw;
++}
+diff --git a/bsd/dev/surya_pmic.h b/bsd/dev/surya_pmic.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/surya_pmic.h
+@@ -0,0 +1,60 @@
++/*
++ * PM8916 PMIC driver interface for surya
++ */
++#ifndef _SURYA_PMIC_H_
++#define _SURYA_PMIC_H_
++
++#include <sys/types.h>
++
++__BEGIN_DECLS
++
++int surya_pmic_init(void);
++int surya_pmic_vadc_read(uint8_t channel, uint16_t *result);
++int surya_pmic_gpio_config(uint8_t gpio, uint8_t config);
++int surya_pmic_gpio_read(uint8_t gpio, uint8_t *val);
++int surya_pmic_gpio_write(uint8_t gpio, uint8_t val);
++uint32_t surya_pmic_get_battery_voltage_mv(void);
++int32_t surya_pmic_get_die_temp_c(void);
++
++__END_DECLS
++
++#endif /* _SURYA_PMIC_H_ */
+diff --git a/bsd/dev/Makefile b/bsd/dev/Makefile
+--- a/bsd/dev/Makefile
++++ b/bsd/dev/Makefile
+@@ -10,6 +10,7 @@
+ 	sweet_keys.o \
+ 	sweet_touch.o \
+ 	sweet_ufs.o \
++	surya_pmic.o \
+ 	sweet_rpmh.o \
+ 	sweet_hid.o \
+ 	_sweet.o
+diff --git a/osfmk/arm/pe_spmi.c b/osfmk/arm/pe_spmi.c
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm/pe_spmi.c
+@@ -0,0 +1,150 @@
++/*
++ * SPMI (System Power Management Interface) support for Qualcomm platforms
++ * Used by PM8916 PMIC on surya
++ */
++#include <arm/pe_spmi.h>
++#include <arm/machine_cpu.h>
++#include <pexpert/pexpert.h>
++#include <kern/kalloc.h>
++
++static vm_offset_t spmi_base = 0;
++static int spmi_initialized = 0;
++
++void
++pe_spmi_init(void)
++{
++	if (spmi_initialized)
++		return;
++	
++	/* Map SPMI controller registers */
++	/* DTB: spmi@200f000 with reg = <0x0200f000 0x1000 0x02400000 0x40000 0x02c00000 0x4000 0x03800000 0x2000 0x0200a000 0x2100> */
++	spmi_base = phystokv(0x0200f000);
++	
++	if (spmi_base) {
++		spmi_initialized = 1;
++		kprintf("SURYA SPMI: controller mapped at %p\n", (void *)spmi_base);
++	}
++}
++
++vm_offset_t
++pe_spmi_get_base(void)
++{
++	return spmi_base;
++}
++
++int
++pe_spmi_read(uint8_t sid, uint16_t addr, uint8_t *val)
++{
++	if (!spmi_initialized)
++		return ENXIO;
++	
++	volatile uint32_t *chnl = (volatile uint32_t *)(spmi_base + 0x1000); /* Channel 0 */
++	
++	uint32_t cmd = 0x01 | (sid << 4) | ((addr >> 8) & 0x7) << 8 | (addr & 0xff) << 16;
++	chnl[0] = cmd;  /* CMD */
++	chnl[1] = 1;    /* LEN */
++	chnl[2] = 1;    /* TRIGGER */
++	
++	/* Wait for completion */
++	for (int i = 0; i < 10000; i++) {
++		if (chnl[3] & 0x1) break; /* STATUS */
++		DELAY(10);
++	}
++	
++	*val = chnl[4] & 0xff; /* DATA */
++	return 0;
++}
++
++int
++pe_spmi_write(uint8_t sid, uint16_t addr, uint8_t val)
++{
++	if (!spmi_initialized)
++		return ENXIO;
++	
++	volatile uint32_t *chnl = (volatile uint32_t *)(spmi_base + 0x1000);
++	
++	uint32_t cmd = 0x02 | (sid << 4) | ((addr >> 8) & 0x7) << 8 | (addr & 0xff) << 16;
++	chnl[0] = cmd;  /* CMD */
++	chnl[1] = 1;    /* LEN */
++	chnl[5] = val;  /* DATA */
++	chnl[2] = 1;    /* TRIGGER */
++	
++	for (int i = 0; i < 10000; i++) {
++		if (chnl[3] & 0x1) break;
++		DELAY(10);
++	}
++	return 0;
++}
++
++int
++pe_spmi_configure_channel(uint8_t channel, uint8_t sid)
++{
++	if (!spmi_initialized)
++		return ENXIO;
++	
++	volatile uint32_t *cnfg = (volatile uint32_t *)(spmi_base + 0x1000 + 0x4000 + 0x4000); /* CNGF */
++	cnfg[channel] = sid;
++	return 0;
++}
+diff --git a/osfmk/arm/pe_spmi.h b/osfmk/arm/pe_spmi.h
+new file mode 100644
+--- /dev/null
++++ b/osfmk/arm/pe_spmi.h
+@@ -0,0 +1,40 @@
++/*
++ * SPMI interface for platform expert
++ */
++#ifndef _PE_SPM_H_
++#define _PE_SPM_H_
++
++__BEGIN_DECLS
++
++void pe_spmi_init(void);
++vm_offset_t pe_spmi_get_base(void);
++int pe_spmi_read(uint8_t sid, uint16_t addr, uint8_t *val);
++int pe_spmi_write(uint8_t sid, uint16_t addr, uint8_t val);
++int pe_spmi_configure_channel(uint8_t channel, uint8_t sid);
++
++__END_DECLS
++
++#endif /* _PE_SPM_H_ */
