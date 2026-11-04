@@ -1,5 +1,5 @@
 #!/bin/bash
-# Surya: ensure makedefs/MakeInc.def supports SURYA and board_config.h defines MAX_*.
+# Surya: ensure MakeInc.def supports SURYA, board_config.h defines MAX_*, and arch string stays plain arm64.
 # dxb runs patches/*.sh from the XNU source root before applying *.patch.
 set -euo pipefail
 
@@ -13,6 +13,18 @@ if [[ -f makedefs/MakeInc.def ]]; then
 MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto\
 MACHINE_FLAGS_ARM64_SURYA = -DARM64_BOARD_CONFIG_SURYA                -march=armv8.2-a+crypto' "$F"
   fi
+  # arch string: keep plain arm64 for SWEET/SURYA (no PAC)
+  python3 - "$F" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)\nexport ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e\nendif"
+new = "ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)\nifneq ($(CURRENT_MACHINE_CONFIG),SWEET)\nifneq ($(CURRENT_MACHINE_CONFIG),SURYA)\nexport ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e\nendif\nendif\nendif"
+if old in s and new not in s:
+    s = s.replace(old, new, 1)
+    open(p, 'w').write(s)
+    print('arch string guard added')
+PY
   echo "Surya MakeInc fix applied"
   grep "SUPPORTED_ARM64_MACHINE_CONFIGS = BCM" "$F"
 fi
@@ -22,7 +34,6 @@ if [[ -f pexpert/pexpert/arm64/board_config.h ]]; then
   F=pexpert/pexpert/arm64/board_config.h
   if ! grep -q "ARM64_BOARD_CONFIG_SURYA" "$F"; then
     python3 - "$F" <<'PY'
-import sys
 p = sys.argv[1]
 s = open(p).read()
 anchor = '#endif  /* ARM64_BOARD_CONFIG_BCM2837 */\n'
@@ -41,6 +52,45 @@ assert anchor in s, 'anchor not found'
 s = s.replace(anchor, block, 1)
 open(p, 'w').write(s)
 print('Surya board_config block added')
+PY
+  fi
+fi
+
+# 3. proc_reg.h: add SURYA block if missing (MMU_CLINE)
+if [[ -f osfmk/arm64/proc_reg.h ]]; then
+  F=osfmk/arm64/proc_reg.h
+  if ! grep -q "ARM64_BOARD_CONFIG_SURYA" "$F"; then
+    python3 - "$F" <<'PY'
+p = sys.argv[1]
+s = open(p).read()
+old = '''#elif defined (VMAPPLE)
+
+/* I-Cache. */
+#define MMU_I_CLINE 6
+
+/* D-Cache. */
+#define MMU_CLINE   6
+'''
+new = '''#elif defined (ARM64_BOARD_CONFIG_SURYA)
+
+/* I-Cache. */
+#define MMU_I_CLINE 6
+
+/* D-Cache. */
+#define MMU_CLINE   6
+
+#elif defined (VMAPPLE)
+
+/* I-Cache. */
+#define MMU_I_CLINE 6
+
+/* D-Cache. */
+#define MMU_CLINE   6
+'''
+assert old in s, 'context not found'
+s = s.replace(old, new, 1)
+open(p, 'w').write(s)
+print('Surya proc_reg block added')
 PY
   fi
 fi
