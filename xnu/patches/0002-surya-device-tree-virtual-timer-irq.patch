@@ -5,7 +5,6 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
   */
  
  #include <stdint.h>
-+#include <libkern/section_keywords.h>
  #include <arm64/proc_reg.h>
  #include <kern/clock.h>
  #include <mach/mach_time.h>
@@ -16,12 +15,12 @@ diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
  
 +#if defined(SURYA)
 +/* Phone default; QEMU virt wires the architected virtual timer to INTID 27. */
-+SECURITY_READ_ONLY_LATE(uint32_t) surya_vtimer_intid = SURYA_VTIMER_INTID;
++uint32_t surya_vtimer_intid = SURYA_VTIMER_INTID;
 +#endif
 +
 +#if defined(SWEET)
 +/* Phone default; QEMU virt wires the architected virtual timer to INTID 27. */
-+SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
++uint32_t sweet_vtimer_intid = SWEET_VTIMER_INTID;
 +#endif
  
  static vm_offset_t gicd_base;
