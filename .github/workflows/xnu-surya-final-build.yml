@@ -58,7 +58,25 @@ jobs:
         working-directory: dxb
         env:
           MAKEFLAGS: -k
-        run: bash build.sh 2>&1 | tee build.log
+        run: |
+          # Start build in background and fix xnu after clone
+          bash build.sh 2>&1 | tee build.log &
+          BUILD_PID=$!
+          # Wait for xnu to be cloned
+          for i in {1..60}; do
+            if [ -f "xnu/makedefs/MakeInc.def" ]; then
+              echo "Found xnu, applying SURYA fix..."
+              sed -i '' 's/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE$/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET SURYA/g' xnu/makedefs/MakeInc.def
+              sed -i '' 's/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET SURYA/g' xnu/makedefs/MakeInc.def
+              grep -q "MACHINE_FLAGS_ARM64_SURYA" xnu/makedefs/MakeInc.def || sed -i '' '/MACHINE_FLAGS_ARM64_BCM2837/a\
+MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto\
+MACHINE_FLAGS_ARM64_SURYA = -DARM64_BOARD_CONFIG_SURYA                -march=armv8.2-a+crypto' xnu/makedefs/MakeInc.def
+              grep "SUPPORTED_ARM64_MACHINE_CONFIGS" xnu/makedefs/MakeInc.def
+              break
+            fi
+            sleep 10
+          done
+          wait $BUILD_PID
 
       - name: Find all kernel files
         if: always()
