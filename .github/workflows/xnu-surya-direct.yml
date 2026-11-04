@@ -1,0 +1,69 @@
+name: xnu-surya-direct
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build xnu kernel for SURYA (direct)
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install aarch64-elf-binutils aarch64-elf-gcc ccache ninja python3
+          python3 -m pip install --user pyaml
+
+      - name: Fetch xnu-8796 source
+        run: |
+          # xnu-8796 = iOS 16 era
+          git clone --depth 1 --branch xnu-8796 https://github.com/apple-oss-distributions/xnu.git xnu-src
+          cd xnu-src
+          # Also need libpthread, hfs, bearssl (staged by darwin-xnu-build)
+          # For now, use the staged versions from our repo
+          cp -R ../xnu/patches/0019-stage-libpthread.sh .
+          cp -R ../xnu/patches/0020-stage-bearssl.sh .
+          cp -R ../xnu/patches/0026-stage-hfs.sh .
+          bash 0019-stage-libpthread.sh
+          bash 0020-stage-bearssl.sh
+          bash 0026-stage-hfs.sh
+
+      - name: Apply SURYA patches only
+        run: |
+          cd xnu-src
+          # Apply only SURYA patches (0001-0008) - these are designed for SURYA
+          for patch in ../xnu/patches/000*-surya-*.patch; do
+            echo "Applying $patch"
+            git apply --whitespace=nowarn "$patch" || exit 1
+          done
+          
+          # Also apply common patches that don't conflict (toolchain, etc.)
+          for patch in ../xnu/patches/0001-new-clang-*.patch ../xnu/patches/0002-new-clang-*.patch; do
+            echo "Applying $patch"
+            git apply --whitespace=nowarn "$patch" || exit 1
+          done
+
+      - name: Configure kernel for SURYA
+        run: |
+          cd xnu-src
+          export CURRENT_MACHINE_CONFIG=SURYA
+          export ARCH_CONFIGS=SURYA
+          make clean
+          ./configure --enable-debug --enable-kasan --disable-werror SURYA
+
+      - name: Build kernel
+        run: |
+          cd xnu-src
+          export CURRENT_MACHINE_CONFIG=SURYA
+          make -j$(sysctl -n hw.ncpu) kernel
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xnu-kernel-surya
+          path: |
+            xnu-src/BUILD/obj/arm64/SURYA/kernel.development.surya
+            xnu-src/BUILD/obj/arm64/SURYA/kernel.development.surya.dSYM
+          retention-days: 30
