@@ -1,0 +1,80 @@
+name: xnu-surya-clean
+
+on:
+  workflow_dispatch:
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACHINE_CONFIG: SURYA
+  KERNEL_CONFIG: DEVELOPMENT
+
+jobs:
+  build:
+    name: Build xnu kernel for SURYA (clean)
+    runs-on: macos-14
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+
+      - name: Install deps
+        run: |
+          brew install jq bash cmake ninja
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+
+      - name: Build
+        working-directory: dxb
+        env:
+          MAKEFLAGS: -j4
+        run: |
+          bash build.sh &
+          BPID=$!
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            sleep 30
+            if [ -d "xnu" ] && [ ! -f "xnu/.surya_patched" ]; then
+              echo "[SURYA] Patching xnu..."
+              for p in ../xnu/patches/000*-surya-*.patch; do
+                [ -f "$p" ] && patch -d xnu -p1 < "$p" || true
+              done
+              for s in ../xnu/patches/0019-stage-libpthread.sh ../xnu/patches/0020-stage-bearssl.sh ../xnu/patches/0026-stage-hfs.sh; do
+                [ -f "$s" ] && (cd xnu && bash "../../$s" || true)
+              done
+              if [ -f "xnu/makedefs/MakeInc.def" ]; then
+                sed -i '' 's/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET SURYA/g' xnu/makedefs/MakeInc.def
+                grep -q "MACHINE_FLAGS_ARM64_SURYA" xnu/makedefs/MakeInc.def || sed -i '' '/MACHINE_FLAGS_ARM64_BCM2837/a\
+MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto\
+MACHINE_FLAGS_ARM64_SURYA = -DARM64_BOARD_CONFIG_SURYA                -march=armv8.2-a+crypto' xnu/makedefs/MakeInc.def
+                echo "[SURYA] Fixed MakeInc.def"
+                grep "SUPPORTED_ARM64_MACHINE_CONFIGS" xnu/makedefs/MakeInc.def
+              fi
+              touch xnu/.surya_patched
+            fi
+            kill -0 $BPID 2>/dev/null || break
+          done
+          wait $BPID
+
+      - name: Collect kernel
+        if: always()
+        run: |
+          mkdir -p kernel-out
+          find dxb -name "kernel.development*" -not -path "*/patches/*" | xargs -I{} cp {} kernel-out/ 2>/dev/null || true
+          find dxb/fakeroot -name "kernel*" 2>/dev/null | xargs -I{} cp {} kernel-out/ 2>/dev/null || true
+          ls -lh kernel-out/ 2>&1 || echo "empty"
+
+      - name: Upload kernel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xnu-kernel-surya-clean
+          path: kernel-out/
