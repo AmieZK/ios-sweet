@@ -1,0 +1,13 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index f8d0d2e..32d2fb2 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -745,7 +745,7 @@ common_start:
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+ 
+-#if !VMAPPLE && !defined(SWEET)
++#if !VMAPPLE && !defined(SWEET) && !defined(ARM64_BOARD_CONFIG_SURYA)
+ 	MOV64   x1, SCTLR_EL1_DEFAULT
+ 	cmp		x0, x1
+ 	bne		.
