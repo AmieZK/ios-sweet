@@ -36,20 +36,8 @@ jobs:
           for f in xnu/patches/000*-surya-*.patch; do
             cp "$f" dxb/patches/
           done
-          # Copy any .sh files needed by surya patches
-          for f in xnu/patches/000*-surya-*.sh; do
-            cp "$f" dxb/patches/ 2>/dev/null || true
-          done
           echo "SURYA patches to apply:"
-          ls -1 dxb/patches/*.patch 2>/dev/null || echo "none"
-
-      - name: Apply SURYA patches
-        working-directory: dxb
-        run: |
-          for patch in patches/*.patch; do
-            echo "Applying $patch"
-            git apply --whitespace=nowarn "$patch" || exit 1
-          done
+          ls -1 dxb/patches/*.patch
 
       - name: Build kernel
         working-directory: dxb
