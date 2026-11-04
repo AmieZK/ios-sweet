@@ -28,8 +28,20 @@ jobs:
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          # Copy ONLY SURYA patches (not sweet - they modify same files and break context)
+          mkdir -p dxb/patches
+          for f in xnu/patches/000*-surya-*.patch; do
+            cp "$f" dxb/patches/
+          done
+          for f in xnu/patches/*.sh; do
+            cp "$f" dxb/patches/
+          done
+          echo "SURYA patches to apply:"
+          ls dxb/patches/*.patch
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          # Fallback: ensure SURYA is in SUPPORTED_ARM64_MACHINE_CONFIGS if patch context doesn't match
+          sed -i '' 's/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE$/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET SURYA/' dxb/makedefs/MakeInc.def || true
+          sed -i '' '/MACHINE_FLAGS_ARM64_BCM2837/a\MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto\nMACHINE_FLAGS_ARM64_SURYA = -DARM64_BOARD_CONFIG_SURYA                -march=armv8.2-a+crypto' dxb/makedefs/MakeInc.def || true
 
       - name: Deps
         run: |
