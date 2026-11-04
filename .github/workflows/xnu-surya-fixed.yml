@@ -1,0 +1,101 @@
+name: xnu-surya-fixed
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: 'Machine config'
+        required: true
+        default: 'SURYA'
+        type: choice
+        options:
+          - SURYA
+
+jobs:
+  build:
+    name: Build xnu kernel for SURYA
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch darwin-xnu-build
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build 663906528d1cd5ea8fde7de6f16de73db9511549
+          git -C dxb checkout -q FETCH_HEAD
+          # Fix arm64 arch
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+
+      - name: Deps
+        run: |
+          brew install jq bash cmake ninja
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig
+
+      - name: Copy sweet patches first (0001-0081)
+        run: |
+          mkdir -p dxb/patches
+          # Copy only sweet patches (0001-0081)
+          for f in xnu/patches/*.patch; do
+            base=$(basename "$f")
+            num=${base%%-*}
+            if [[ $num =~ ^0*([0-9]+)$ ]]; then
+              n=${BASH_REMATCH[1]}
+              if (( n >= 1 && n <= 81 )); then
+                cp "$f" dxb/patches/
+              fi
+            fi
+          done
+          for f in xnu/patches/*.sh; do
+            cp "$f" dxb/patches/
+          done
+          echo "Copied sweet patches:"
+          ls dxb/patches/*.patch | wc -l
+
+      - name: Apply sweet patches
+        working-directory: dxb
+        run: |
+          for patch in patches/*.patch; do
+            echo "Applying $patch"
+            git apply --whitespace=nowarn "$patch" || exit 1
+          done
+
+      - name: Apply SURYA patches on top
+        run: |
+          cd ..
+          # Apply SURYA patches (0001-0008) on top of sweet
+          for f in xnu/patches/000*-surya-*.patch; do
+            echo "Applying $f"
+            cd dxb
+            git apply --whitespace=nowarn "../$f" || exit 1
+            cd ..
+          done
+
+      - name: Build kernel
+        working-directory: dxb
+        env:
+          MACHINE_CONFIG: SURYA
+          KERNEL_CONFIG: DEVELOPMENT
+          MAKEFLAGS: -k
+        run: bash build.sh
+
+      - name: Collect kernel
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel-surya
+          path: out/
+          if-no-files-found: warn
