@@ -1,0 +1,75 @@
+name: xnu-surya-final
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build xnu kernel for SURYA
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch darwin-xnu-build
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build 663906528d1cd5ea8fde7de6f16de73db9511549
+          git -C dxb checkout -q FETCH_HEAD
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+
+      - name: Deps
+        run: |
+          brew install jq bash cmake ninja
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig
+
+      - name: Copy SURYA patches only (no sweet conflicts)
+        run: |
+          mkdir -p dxb/patches
+          # Copy ONLY SURYA patches - no sweet patches to avoid conflicts
+          for f in xnu/patches/000*-surya-*.patch; do
+            cp "$f" dxb/patches/
+          done
+          # Copy any .sh files needed by surya patches
+          for f in xnu/patches/000*-surya-*.sh; do
+            cp "$f" dxb/patches/ 2>/dev/null || true
+          done
+          echo "SURYA patches to apply:"
+          ls -1 dxb/patches/*.patch 2>/dev/null || echo "none"
+
+      - name: Apply SURYA patches
+        working-directory: dxb
+        run: |
+          for patch in patches/*.patch; do
+            echo "Applying $patch"
+            git apply --whitespace=nowarn "$patch" || exit 1
+          done
+
+      - name: Build kernel
+        working-directory: dxb
+        env:
+          MACHINE_CONFIG: SURYA
+          KERNEL_CONFIG: DEVELOPMENT
+          MAKEFLAGS: -k
+        run: bash build.sh
+
+      - name: Collect kernel
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel-surya
+          path: out/
+          if-no-files-found: warn
