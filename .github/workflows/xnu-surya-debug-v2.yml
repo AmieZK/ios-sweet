@@ -1,0 +1,74 @@
+name: xnu-surya-debug-v2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build xnu kernel for SURYA (debug v2)
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch darwin-xnu-build
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build 663906528d1cd5ea8fde7de6f16de73db9511549
+          git -C dxb checkout -q FETCH_HEAD
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+
+      - name: Deps
+        run: |
+          brew install jq bash cmake ninja
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig
+
+      - name: Copy ALL patches (sweet + surya)
+        run: |
+          mkdir -p dxb/patches
+          cp xnu/patches/*.patch dxb/patches/
+          cp xnu/patches/*.sh dxb/patches/ 2>/dev/null || true
+
+      - name: Build kernel
+        working-directory: dxb
+        env:
+          MACHINE_CONFIG: SURYA
+          KERNEL_CONFIG: DEVELOPMENT
+          MAKEFLAGS: -k
+        run: |
+          bash build.sh 2>&1 | tee build.log
+          echo "=== Searching for kernel ==="
+          find . -name "kernel*" -type f 2>/dev/null | head -20
+          echo "=== Kernels dir ==="
+          ls -la fakeroot/System/Library/Kernels/ 2>/dev/null || echo "No kernels dir"
+
+      - name: Upload build log
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-surya-v2
+          path: dxb/build.log
+
+      - name: Find and upload kernel
+        if: always()
+        run: |
+          # Search for any kernel files
+          KERNEL=$(find dxb -name "kernel*" -type f 2>/dev/null | head -1)
+          echo "Found kernel: $KERNEL"
+          if [ -n "$KERNEL" ]; then
+            mkdir -p kernel-out
+            cp "$KERNEL" kernel-out/
+            ls -la kernel-out/
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel-surya-v2
+          path: kernel-out/
+          if-no-files-found: warn
