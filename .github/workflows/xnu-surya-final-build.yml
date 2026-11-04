@@ -1,0 +1,82 @@
+name: xnu-surya-final-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      machine_config:
+        description: 'MACHINE_CONFIG'
+        required: true
+        default: 'SURYA'
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: 13.5
+  KERNEL_CONFIG: DEVELOPMENT
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'SURYA' }}
+
+jobs:
+  build:
+    name: Build xnu kernel for ${{ inputs.machine_config }}
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig
+
+      - name: Build kernel
+        working-directory: dxb
+        env:
+          MAKEFLAGS: -k
+        run: bash build.sh 2>&1 | tee build.log
+
+      - name: Find all kernel files
+        if: always()
+        run: |
+          echo "=== All kernel files ==="
+          find dxb -name "kernel*" -type f 2>/dev/null || echo "None found"
+          echo "=== All .dyld files ==="
+          find dxb -name "*.dyld" -type f 2>/dev/null || echo "None found"
+          echo "=== fakeroot contents ==="
+          find dxb/fakeroot -type f 2>/dev/null | head -30 || echo "No fakeroot"
+
+      - name: Collect kernels
+        if: always()
+        run: |
+          mkdir -p kernel-out
+          # Copy any kernel-like files
+          find dxb -name "kernel*" -type f -exec cp {} kernel-out/ \; 2>/dev/null || true
+          find dxb -name "*.dyld" -type f -exec cp {} kernel-out/ \; 2>/dev/null || true
+          echo "=== Collected ==="
+          ls -la kernel-out/ 2>/dev/null || echo "Empty"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel-surya-final
+          path: kernel-out/
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log-surya-final
+          path: dxb/build.log
