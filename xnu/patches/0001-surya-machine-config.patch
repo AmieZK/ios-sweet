@@ -66,8 +66,8 @@ index c40c6ea..9888608 100644
  #include <arm64/machine_machdep.h>
 @@ -1855,6 +1856,58 @@ sleh_irq(arm_saved_state_t *state)
  #endif
- 
- 
+  
+  
 +#if defined(SURYA)
 +	/*
 +	 * surya: QGIC2 interrupt controller (GICv3 compatible but different reg layout).
@@ -105,17 +105,17 @@ index c40c6ea..9888608 100644
 +	}
 +	__builtin_arm_isb(ISB_SY);
 +#else
- 	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
- 
- #if USE_APPLEARMSMP
++	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++  
++#if USE_APPLEARMSMP
 @@ -1866,6 +1919,7 @@ sleh_irq(arm_saved_state_t *state)
  	    cdp->interrupt_nub,
  	    cdp->interrupt_source);
  #endif
 +#endif /* SURYA */
- 
+  
  	entropy_collect();
- 
+  
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index e5336e5..f8d0d2e 100644
 --- a/osfmk/arm64/start.s
@@ -123,7 +123,7 @@ index e5336e5..f8d0d2e 100644
 @@ -745,11 +745,11 @@ common_start:
  	MSR_SCTLR_EL1_X0
  	isb		sy
- 
+  
 -#if !VMAPPLE
 +#if !VMAPPLE && !defined(SWEET) && !defined(SURYA)
  	MOV64   x1, SCTLR_EL1_DEFAULT
@@ -131,7 +131,7 @@ index e5336e5..f8d0d2e 100644
  	bne		.
 -#endif /* !VMAPPLE */
 +#endif /* !VMAPPLE && !SWEET && !SURYA */
- 
+  
  #if (!CONFIG_KERNEL_INTEGRITY || (CONFIG_KERNEL_INTEGRITY && !defined(KERNEL_INTEGRITY_WT)))
  	/* Watchtower
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
@@ -139,9 +139,9 @@ index 3ad743f..4ec6989 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
 @@ -141,11 +141,33 @@ pe_init_fiq()
- 		}
- 	}
- 
+  		}
+  	}
+  
 +#if defined(SURYA)
 +	/*
 +	 * surya: QGIC2 with two security states. Group 0 is TrustZone's.
@@ -166,19 +166,19 @@ index 3ad743f..4ec6989 100644
 +	}
 +	gicr_write32(GICR_ISENABLER0, (1U << SWEET_VTIMER_INTID) | (1U << SWEET_IPI_SGI));
 +#else
- 	// Configure timers and legacy FIQ to be group 0
- 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
- 
- 	// Enable PPI 27
- 	gicr_write32(GICR_ISENABLER0, (1 << 27));
++	// Configure timers and legacy FIQ to be group 0
++	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
++  
++	// Enable PPI 27
++	gicr_write32(GICR_ISENABLER0, (1 << 27));
 +#endif /* SURYA || SWEET */
- 
- 	// Enable system register access
- 	uint64_t icc_sre = __builtin_arm_rsr64("ICC_SRE_EL1");
+  
++	// Enable system register access
++	uint64_t icc_sre = __builtin_arm_rsr64("ICC_SRE_EL1");
 @@ -153,8 +175,16 @@ pe_init_fiq()
  	__builtin_arm_wsr64("ICC_SRE_EL1", icc_sre);
  	__builtin_arm_isb(ISB_SY);
- 
+  
 +#if defined(SURYA) || defined(SWEET)
 +	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
 +#else
@@ -186,12 +186,12 @@ index 3ad743f..4ec6989 100644
  	__builtin_arm_wsr64("ICC_BPR0_EL1", 0);
 +#endif /* SURYA || SWEET */
  	__builtin_arm_wsr64("ICC_PMR_EL1", 0xFF);
- 
+  
  	// Set EOI mode of this processor
 @@ -162,12 +192,28 @@ pe_init_fiq()
  	icc_ctlr &= ~ICC_CTLR_EOIMODE;
  	__builtin_arm_wsr64("ICC_CTLR_EL1", icc_ctlr);
- 
+  
 +#if defined(SURYA) || defined(SWEET)
 +	// ABL leaves only ARE_NS set; Linux writes ARE_NS | EnableGrp1A | EnableGrp1
 +	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
@@ -203,12 +203,12 @@ index 3ad743f..4ec6989 100644
 +	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
 +	__builtin_arm_isb(ISB_SY);
 +#else
- 	// Enable the forwarding of the vtimer interrupt
- 	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
- 	gicd_ctlr |= GICD_CTLR_ENABLEGRP0;
- 	gicd_write32(GICD_CTLR, gicd_ctlr);
- 	__builtin_arm_wsr64("ICC_IGRPEN0_EL1", 1);
- 	__builtin_arm_isb(ISB_SY);
++	// Enable the forwarding of the vtimer interrupt
++	uint32_t gicd_ctlr = gicd_read32(GICD_CTLR);
++	gicd_ctlr |= GICD_CTLR_ENABLEGRP0;
++	gicd_write32(GICD_CTLR, gicd_ctlr);
++	__builtin_arm_wsr64("ICC_IGRPEN0_EL1", 1);
++	__builtin_arm_isb(ISB_SY);
 +#endif /* SURYA || SWEET */
  }
  #else
@@ -225,8 +225,8 @@ index 8226b8c..c7d274f 100644
 +	BCM2837.h \
 +	SWEET.h \
 +	SURYA.h
- 
- 
+  
+  
  # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
 diff --git a/pexpert/pexpert/arm64/SURYA.h b/pexpert/pexpert/arm64/SURYA.h
 new file mode 100644
@@ -330,5 +330,5 @@ index 9454534..88e524a 100644
 +
 +#ifdef ARM64_BOARD_CONFIG_SWEET
  #include <pexpert/arm64/SWEET.h>
- 
+  
  #define MAX_L2_CLINE                   6
