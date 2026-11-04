@@ -1,5 +1,5 @@
 #!/bin/bash
-# Surya: ensure MakeInc.def supports SURYA, board_config.h defines MAX_*, and arch string stays plain arm64.
+# Surya: ensure MakeInc.def supports SURYA, board_config.h defines MAX_*, proc_reg.h defines MMU_CLINE, and arch string stays plain arm64.
 # dxb runs patches/*.sh from the XNU source root before applying *.patch.
 set -euo pipefail
 
@@ -13,7 +13,6 @@ if [[ -f makedefs/MakeInc.def ]]; then
 MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto\
 MACHINE_FLAGS_ARM64_SURYA = -DARM64_BOARD_CONFIG_SURYA                -march=armv8.2-a+crypto' "$F"
   fi
-  # arch string: keep plain arm64 for SWEET/SURYA (no PAC)
   python3 - "$F" <<'PY'
 import sys
 p = sys.argv[1]
@@ -34,6 +33,7 @@ if [[ -f pexpert/pexpert/arm64/board_config.h ]]; then
   F=pexpert/pexpert/arm64/board_config.h
   if ! grep -q "ARM64_BOARD_CONFIG_SURYA" "$F"; then
     python3 - "$F" <<'PY'
+import sys
 p = sys.argv[1]
 s = open(p).read()
 anchor = '#endif  /* ARM64_BOARD_CONFIG_BCM2837 */\n'
@@ -61,6 +61,7 @@ if [[ -f osfmk/arm64/proc_reg.h ]]; then
   F=osfmk/arm64/proc_reg.h
   if ! grep -q "ARM64_BOARD_CONFIG_SURYA" "$F"; then
     python3 - "$F" <<'PY'
+import sys
 p = sys.argv[1]
 s = open(p).read()
 old = '''#elif defined (VMAPPLE)
