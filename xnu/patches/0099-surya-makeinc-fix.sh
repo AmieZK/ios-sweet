@@ -7,18 +7,11 @@ set -euo pipefail
 if [[ ! -f pexpert/pexpert/arm64/SURYA.h ]]; then
   mkdir -p pexpert/pexpert/arm64
   cat > pexpert/pexpert/arm64/SURYA.h <<'SURYA_H_EOF'
-/*
- * Board config for the Poco X3 NFC ("surya", Qualcomm SM7150 / Snapdragon 732G):
- * Kryo 470 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.
- */
 #ifndef _PEXPERT_ARM64_SURYA_H
 #define _PEXPERT_ARM64_SURYA_H
-
 #define NO_MONITOR                1
 #define NO_ECORE                  1
-
 #define SURYA                     1
-
 #define ARM_ARCH_TIMER
 #define __ARM_ARCH__              8
 #define __ARM_VMSA__              8
@@ -29,78 +22,52 @@ if [[ ! -f pexpert/pexpert/arm64/SURYA.h ]]; then
 #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
 #define __ARM_PAN_AVAILABLE__     1
 #define __ARM_16K_PG__            1
-
 #define HAS_GIC_V3                1
-
 #ifndef ASSEMBLER
 #define PLATFORM_PANIC_LOG_DISABLED
-#endif /* ! ASSEMBLER */
-
+#endif
 #define SURYA_VTIMER_INTID        27
 #define SURYA_IPI_SGI             1
-
 #define GIC_SPURIOUS_IRQ          1023
-
-#define GICR_PE_SIZE              0x20000
-
-#define GICD_CTLR                 0x0
-#define GICD_CTLR_ENABLEGRP1      0x1
-#define GICD_CTLR_ENABLEGRP1A     0x2
-#define GICD_CTLR_ARE_NS          0x10
-#define GICD_CTLR_RWP             0x80000000
-
-#define GICR_TYPER                              0x08
-#define GICR_WAKER                              0x14
-#define GICR_IGROUPR0                           0x10080
-#define GICR_ISENABLER0                         0x10100
-#define GICR_IPRIORITYR0                        0x10400
-
-#define GICR_TYPER_AFFINITY_VALUE_SHIFT         32
-#define GICR_TYPER_LAST                         0x10
-
-#define GICR_WAKER_PROCESSORSLEEP               0x2
-#define GICR_WAKER_CHILDRENASLEEP               0x4
-
-#define ICC_CTLR_EOIMODE                        0x2
-#define ICC_SRE_SRE                             0x1
-
 #endif /* ! _PEXPERT_ARM64_SURYA_H */
 SURYA_H_EOF
   echo "Surya.h created"
 fi
 
-# 1. MakeInc.def
+# 1. MakeInc.def (Python-based, robust)
 if [[ -f makedefs/MakeInc.def ]]; then
-  F=makedefs/MakeInc.def
-  sed -i '' 's/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE$/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET SURYA/' "$F"
-  sed -i '' 's/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET$/SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET SURYA/' "$F"
-  if ! grep -q "MACHINE_FLAGS_ARM64_SURYA" "$F"; then
-    sed -i '' '/MACHINE_FLAGS_ARM64_BCM2837/a\
-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto\
-MACHINE_FLAGS_ARM64_SURYA = -DARM64_BOARD_CONFIG_SURYA                -march=armv8.2-a+crypto' "$F"
-  fi
-  python3 - "$F" <<'PY'
-import sys
-p = sys.argv[1]
+  python3 - <<'PY'
+import re
+p = 'makedefs/MakeInc.def'
 s = open(p).read()
+# SUPPORTED list
+if 'SURYA' not in s.split('SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837')[1].split('\n')[0]:
+    s = s.replace('SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE',
+                  'SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET SURYA')
+    s = s.replace('SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET',
+                  'SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET SURYA')
+# MACHINE_FLAGS
+if 'MACHINE_FLAGS_ARM64_SURYA' not in s:
+    s = s.replace('MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837',
+                  'MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837\nMACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto\nMACHINE_FLAGS_ARM64_SURYA = -DARM64_BOARD_CONFIG_SURYA                -march=armv8.2-a+crypto')
+# arch string guard
 old = "ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)\nexport ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e\nendif"
 new = "ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)\nifneq ($(CURRENT_MACHINE_CONFIG),SWEET)\nifneq ($(CURRENT_MACHINE_CONFIG),SURYA)\nexport ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e\nendif\nendif\nendif"
 if old in s and new not in s:
     s = s.replace(old, new, 1)
-    open(p, 'w').write(s)
-    print('arch string guard added')
+open(p, 'w').write(s)
+print('MakeInc.def updated')
 PY
   echo "Surya MakeInc fix applied"
-  grep "SUPPORTED_ARM64_MACHINE_CONFIGS = BCM" "$F"
+  grep "SUPPORTED_ARM64_MACHINE_CONFIGS = BCM" makedefs/MakeInc.def
+  grep "MACHINE_FLAGS_ARM64_SURYA" makedefs/MakeInc.def
 fi
 
 # 2. board_config.h: add SURYA block if missing
 if [[ -f pexpert/pexpert/arm64/board_config.h ]]; then
-  F=pexpert/pexpert/arm64/board_config.h
-  if ! grep -q "ARM64_BOARD_CONFIG_SURYA" "$F"; then
-    python3 - "$F" <<'PY'
-import sys
-p = sys.argv[1]
+  if ! grep -q "ARM64_BOARD_CONFIG_SURYA" pexpert/pexpert/arm64/board_config.h; then
+    python3 - <<'PY'
+p = 'pexpert/pexpert/arm64/board_config.h'
 s = open(p).read()
 anchor = '#endif  /* ARM64_BOARD_CONFIG_BCM2837 */\n'
 block = anchor + '''
@@ -124,11 +91,9 @@ fi
 
 # 3. proc_reg.h: add SURYA block if missing (MMU_CLINE)
 if [[ -f osfmk/arm64/proc_reg.h ]]; then
-  F=osfmk/arm64/proc_reg.h
-  if ! grep -q "ARM64_BOARD_CONFIG_SURYA" "$F"; then
-    python3 - "$F" <<'PY'
-import sys
-p = sys.argv[1]
+  if ! grep -q "ARM64_BOARD_CONFIG_SURYA" osfmk/arm64/proc_reg.h; then
+    python3 - <<'PY'
+p = 'osfmk/arm64/proc_reg.h'
 s = open(p).read()
 old = '''#elif defined (VMAPPLE)
 
